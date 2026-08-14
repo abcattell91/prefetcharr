@@ -29,7 +29,11 @@ impl From<User> for super::User {
     }
 }
 
-fn i32_from_string<'de, D>(deserializer: D) -> Result<i32, D::Error>
+/// Tautulli reports these as strings, and as an empty string for media that
+/// has no such index — a movie or a music track. Those are not errors, just
+/// sessions we have no use for, so they deserialize to `None` and are rejected
+/// by the `media_type` check in `extract`.
+fn optional_i32_from_string<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -40,9 +44,11 @@ where
         Int(i32),
     }
 
-    match StringOrInt::deserialize(deserializer)? {
-        StringOrInt::String(s) => s.parse::<i32>().map_err(de::Error::custom),
-        StringOrInt::Int(i) => Ok(i),
+    match Option::<StringOrInt>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(StringOrInt::String(s)) if s.is_empty() => Ok(None),
+        Some(StringOrInt::String(s)) => s.parse::<i32>().map(Some).map_err(de::Error::custom),
+        Some(StringOrInt::Int(i)) => Ok(Some(i)),
     }
 }
 
@@ -50,10 +56,10 @@ where
 pub struct Episode {
     grandparent_title: String,
     grandparent_guids: Vec<String>,
-    #[serde(deserialize_with = "i32_from_string")]
-    media_index: i32,
-    #[serde(deserialize_with = "i32_from_string")]
-    parent_media_index: i32,
+    #[serde(default, deserialize_with = "optional_i32_from_string")]
+    media_index: Option<i32>,
+    #[serde(default, deserialize_with = "optional_i32_from_string")]
+    parent_media_index: Option<i32>,
     media_type: String,
     #[serde(flatten)]
     user: User,
@@ -124,23 +130,43 @@ impl ProvideNowPlaying for Client {
 
         Ok(sessions
             .iter()
-            .cloned()
-            .map(serde_json::value::from_value)
-            .inspect(|r| {
-                if let Err(e) = r {
-                    warn!(error = ?e, "Skipping Tautulli session due to deserialization error");
-                }
-            })
-            .filter_map(Result::ok)
+            .filter_map(
+                |session| match serde_json::value::from_value(session.clone()) {
+                    Ok(episode) => Some(episode),
+                    Err(e) => {
+                        // Name the session, otherwise this is undiagnosable: the
+                        // serde error alone says nothing about which one it was.
+                        let field = |name: &str| {
+                            session
+                                .get(name)
+                                .and_then(Value::as_str)
+                                .unwrap_or("?")
+                                .to_string()
+                        };
+                        warn!(
+                            error = ?e,
+                            media_type = field("media_type"),
+                            title = field("full_title"),
+                            user = field("username"),
+                            "Skipping Tautulli session due to deserialization error"
+                        );
+                        None
+                    }
+                },
+            )
             .collect())
     }
 
     async fn extract(&self, session: Self::Session) -> anyhow::Result<NowPlaying> {
         if session.media_type != "episode" {
-            bail!("not an episode");
+            bail!("not an episode but a {}", session.media_type);
         }
-        let episode = session.media_index;
-        let season = session.parent_media_index;
+        let episode = session
+            .media_index
+            .context("episode session without an episode number")?;
+        let season = session
+            .parent_media_index
+            .context("episode session without a season number")?;
 
         let tvdb_id = session.grandparent_guids.iter().find_map(|uri| {
             let (provider, id) = uri.split_once("://")?;
@@ -289,8 +315,8 @@ mod test {
         let session_expect = Episode {
             grandparent_title: "Test Show".into(),
             grandparent_guids: vec!["tvdb://1234".into()],
-            media_index: 5,
-            parent_media_index: 3,
+            media_index: Some(5),
+            parent_media_index: Some(3),
             media_type: "episode".into(),
             user: tautulli::User {
                 name: "user".into(),
@@ -481,6 +507,126 @@ mod test {
         let client = tautulli::Client::new(&server.url("/pathprefix"), "secret")?;
         let session = client.sessions().await?.into_iter().next().unwrap();
         assert!(client.extract(session).await.is_err());
+
+        Ok(())
+    }
+
+    // A movie reports empty index strings. That must deserialize cleanly and be
+    // rejected as "not an episode", not fail parsing and warn about an integer.
+    #[tokio::test]
+    async fn empty_media_index_is_not_an_error() -> Result<(), Box<dyn std::error::Error>> {
+        let server = httpmock::MockServer::start_async().await;
+
+        server
+            .mock_async(|when, then| {
+                when.path("/pathprefix/api/v2");
+                #[allow(clippy::unreadable_literal)]
+                then.json_body(serde_json::json!(
+                    {
+                        "response": {
+                            "data": {
+                                "sessions": [{
+                                    "grandparent_title": "",
+                                    "grandparent_guids": [],
+                                    "media_index": "",
+                                    "parent_media_index": "",
+                                    "media_type": "movie",
+                                    "user_id": 29344801,
+                                    "username": "user",
+                                    "library_name": "Movies"
+                                }]
+                            }
+                        }
+                    }
+                ));
+            })
+            .await;
+
+        let client = tautulli::Client::new(&server.url("/pathprefix"), "secret")?;
+
+        // The session parses — no deserialization warning — and is then
+        // rejected for what it actually is.
+        let sessions = client.sessions().await?;
+        assert_eq!(sessions.len(), 1);
+        let err = client
+            .extract(sessions.into_iter().next().unwrap())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not an episode"), "{err}");
+
+        Ok(())
+    }
+
+    // An episode session missing its index is still an error, just a clear one
+    #[tokio::test]
+    async fn episode_without_index_errors() -> Result<(), Box<dyn std::error::Error>> {
+        let server = httpmock::MockServer::start_async().await;
+
+        server
+            .mock_async(|when, then| {
+                when.path("/pathprefix/api/v2");
+                #[allow(clippy::unreadable_literal)]
+                then.json_body(serde_json::json!(
+                    {
+                        "response": {
+                            "data": {
+                                "sessions": [{
+                                    "grandparent_title": "Test Show",
+                                    "grandparent_guids": ["tvdb://1234"],
+                                    "media_index": "",
+                                    "parent_media_index": "3",
+                                    "media_type": "episode",
+                                    "user_id": 29344801,
+                                    "username": "user",
+                                    "library_name": "TV Shows"
+                                }]
+                            }
+                        }
+                    }
+                ));
+            })
+            .await;
+
+        let client = tautulli::Client::new(&server.url("/pathprefix"), "secret")?;
+        let session = client.sessions().await?.into_iter().next().unwrap();
+        let err = client.extract(session).await.unwrap_err();
+        assert!(err.to_string().contains("episode number"), "{err}");
+
+        Ok(())
+    }
+
+    // A genuinely malformed index still fails, rather than being silently zeroed
+    #[tokio::test]
+    async fn garbage_media_index_still_skipped() -> Result<(), Box<dyn std::error::Error>> {
+        let server = httpmock::MockServer::start_async().await;
+
+        server
+            .mock_async(|when, then| {
+                when.path("/pathprefix/api/v2");
+                #[allow(clippy::unreadable_literal)]
+                then.json_body(serde_json::json!(
+                    {
+                        "response": {
+                            "data": {
+                                "sessions": [{
+                                    "grandparent_title": "Test Show",
+                                    "grandparent_guids": ["tvdb://1234"],
+                                    "media_index": "not a number",
+                                    "parent_media_index": "3",
+                                    "media_type": "episode",
+                                    "user_id": 29344801,
+                                    "username": "user",
+                                    "library_name": "TV Shows"
+                                }]
+                            }
+                        }
+                    }
+                ));
+            })
+            .await;
+
+        let client = tautulli::Client::new(&server.url("/pathprefix"), "secret")?;
+        assert!(client.sessions().await?.is_empty());
 
         Ok(())
     }
