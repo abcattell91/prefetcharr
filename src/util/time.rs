@@ -90,7 +90,10 @@ mod test {
         let expected = Some(1_735_689_600);
         assert_eq!(parse_utc_timestamp("2025-01-01T00:00:00"), expected);
         assert_eq!(parse_utc_timestamp("2025-01-01T00:00:00.123Z"), expected);
-        assert_eq!(parse_utc_timestamp("2025-01-01T00:00:00.1234567Z"), expected);
+        assert_eq!(
+            parse_utc_timestamp("2025-01-01T00:00:00.1234567Z"),
+            expected
+        );
     }
 
     // Leap years are handled by the civil-date conversion

@@ -282,7 +282,12 @@ async fn sonarr_instances(config: &Config) -> anyhow::Result<Vec<process::Instan
             client,
             sonarr.libraries.clone(),
             sonarr.exclude_tag.clone().map(sonarr::Tag::from),
-            sonarr.boost.iter().cloned().map(boost::Rule::from).collect(),
+            sonarr
+                .boost
+                .iter()
+                .cloned()
+                .map(boost::Rule::from)
+                .collect(),
         ));
     }
 

@@ -238,7 +238,11 @@ impl Client {
             .await
             .context("error fetching the download queue")?;
 
-        Ok(queue.records.into_iter().filter_map(|r| r.episode_id).collect())
+        Ok(queue
+            .records
+            .into_iter()
+            .filter_map(|r| r.episode_id)
+            .collect())
     }
 
     #[instrument(skip(self))]

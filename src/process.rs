@@ -1446,7 +1446,10 @@ mod test {
 
         // The profile was still applied — that is what makes future upgrades
         // possible — but nothing needed searching.
-        assert_eq!(fake.series_state(1234)["qualityProfileId"].as_i64(), Some(9));
+        assert_eq!(
+            fake.series_state(1234)["qualityProfileId"].as_i64(),
+            Some(9)
+        );
         assert!(fake.commands().is_empty());
         assert!(!fake.episode(16)["monitored"].as_bool().unwrap());
         Ok(())
@@ -1469,7 +1472,10 @@ mod test {
         // s01e05 is playing
         assert!(!fake.episode(15)["monitored"].as_bool().unwrap());
         for command in fake.commands() {
-            let ids = command["episodeIds"].as_array().cloned().unwrap_or_default();
+            let ids = command["episodeIds"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             assert!(
                 !ids.contains(&json!(15)),
                 "the playing episode must not be searched: {command}"
@@ -1613,7 +1619,10 @@ mod test {
             );
         }
         // The profile is left alone for a user without a rule
-        assert_eq!(fake.series_state(1234)["qualityProfileId"].as_i64(), Some(1));
+        assert_eq!(
+            fake.series_state(1234)["qualityProfileId"].as_i64(),
+            Some(1)
+        );
         Ok(())
     }
 
@@ -1645,8 +1654,7 @@ mod test {
     // A series held by a second instance is found there
     #[tokio::test]
     #[test_log::test]
-    async fn routes_to_the_instance_holding_the_series()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn routes_to_the_instance_holding_the_series() -> Result<(), Box<dyn std::error::Error>> {
         let empty = FakeSonarr::start().await;
         let fake = FakeSonarr::start().await;
         fake.add_series(default_series());
@@ -1756,7 +1764,10 @@ mod test {
             })
             .await?;
 
-        assert_eq!(anime.series_state(1234)["qualityProfileId"].as_i64(), Some(9));
+        assert_eq!(
+            anime.series_state(1234)["qualityProfileId"].as_i64(),
+            Some(9)
+        );
         assert_eq!(tv.series_state(1234)["qualityProfileId"].as_i64(), Some(1));
         assert!(tv.commands().is_empty());
         Ok(())
