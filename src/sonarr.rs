@@ -257,6 +257,19 @@ impl Client {
         }
     }
 
+    /// Like [`Self::update_tag`], but for tags this program creates itself.
+    ///
+    /// An unknown label is the normal state until the tag is first applied, so
+    /// it is not worth warning about.
+    #[instrument(skip(self))]
+    pub async fn resolve_tag_quiet(&self, tag: &mut Tag) {
+        let Tag::Label(label) = tag else { return };
+        match self.resolve_tag(label).await {
+            Ok(id) => *tag = Tag::Id(id),
+            Err(err) => debug!(tag=%label, "tag not in Sonarr yet: {err:#}"),
+        }
+    }
+
     async fn set_monitored_episodes(
         &self,
         episode_ids: Vec<i32>,

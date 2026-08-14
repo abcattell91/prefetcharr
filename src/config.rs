@@ -5,6 +5,7 @@ use serde::Deserialize;
 use crate::LegacyArgs;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MediaServer {
     /// Media server type
     pub r#type: crate::MediaServer,
@@ -21,6 +22,7 @@ pub struct MediaServer {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sonarr {
     /// Instance name, only used to tell instances apart in the logs
     pub name: Option<String>,
@@ -40,6 +42,7 @@ pub struct Sonarr {
 
 /// Upgrade the quality of upcoming episodes for specific users.
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Boost {
     /// User IDs or names this rule applies to
     pub users: Vec<String>,
@@ -71,11 +74,26 @@ fn default_search_cooldown() -> u64 {
 /// Either a single `[sonarr]` table or an array of `[[sonarr]]` tables.
 ///
 /// The single-table form predates multi-instance support and stays valid.
-#[derive(Deserialize)]
-#[serde(untagged)]
 pub enum SonarrConfig {
     One(Box<Sonarr>),
     Many(Vec<Sonarr>),
+}
+
+// Hand-written rather than `#[serde(untagged)]`: an untagged enum reports only
+// "data did not match any variant", discarding the error that says which field
+// was wrong. Dispatching on the shape keeps the real message.
+impl<'de> Deserialize<'de> for SonarrConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = toml::Value::deserialize(deserializer)?;
+        match value {
+            toml::Value::Array(_) => Vec::<Sonarr>::deserialize(value).map(SonarrConfig::Many),
+            _ => Sonarr::deserialize(value).map(|s| SonarrConfig::One(Box::new(s))),
+        }
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl SonarrConfig {
@@ -111,7 +129,11 @@ impl From<LogLevel> for tracing::Level {
 // Independent on/off knobs, not a state machine — an enum per pair would only
 // obscure what the TOML says.
 #[allow(clippy::struct_excessive_bools)]
+// A mistyped key is a silent no-op otherwise: `[[sonarr-anime]]` instead of a
+// second `[[sonarr]]` parses fine as an unrelated key, and the instance simply
+// never exists. Fail at startup instead.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub media_server: MediaServer,
     pub sonarr: SonarrConfig,
@@ -288,6 +310,77 @@ mod test {
         assert_eq!(boost.prefetch_num, 3);
         assert_eq!(boost.tag, "hq-boosted");
         assert_eq!(boost.search_cooldown, 3600);
+    }
+
+    // A mistyped instance key must fail loudly. Written as `[[sonarr-anime]]`
+    // it is a valid but unread key, so the instance would otherwise be missing
+    // with nothing in the log to say so.
+    #[test]
+    fn unknown_key_is_rejected() {
+        let result = toml::from_str::<Config>(
+            r#"
+            interval = 450
+            prefetch_num = 30
+            request_seasons = true
+            connection_retries = 12
+
+            [media_server]
+            type = "Tautulli"
+            url = "http://example.com"
+            api_key = "secret"
+
+            [[sonarr]]
+            name = "television"
+            url = "http://example.com/sonarr"
+            api_key = "secret"
+
+            [[sonarr-anime]]
+            name = "anime"
+            url = "http://example.com/sonarr-anime"
+            api_key = "secret"
+            "#,
+        );
+
+        // Config holds API keys and deliberately has no Debug impl, so match
+        // rather than unwrap_err.
+        let Err(err) = result else {
+            panic!("the unknown `sonarr-anime` key must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("sonarr-anime"), "unhelpful error: {msg}");
+    }
+
+    // A typo inside a boost rule is rejected too
+    #[test]
+    fn unknown_boost_key_is_rejected() {
+        let result = toml::from_str::<Config>(
+            r#"
+            interval = 450
+            prefetch_num = 30
+            request_seasons = true
+            connection_retries = 12
+
+            [media_server]
+            type = "Tautulli"
+            url = "http://example.com"
+            api_key = "secret"
+
+            [[sonarr]]
+            url = "http://example.com/sonarr"
+            api_key = "secret"
+
+              [[sonarr.boost]]
+              users = [ "someone" ]
+              quality_profile = "HQ"
+              qualityprofile = "typo"
+            "#,
+        );
+
+        let Err(err) = result else {
+            panic!("the unknown `qualityprofile` key must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("qualityprofile"), "unhelpful error: {msg}");
     }
 
     // An instance without boost rules keeps working alongside one with them

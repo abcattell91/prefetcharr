@@ -72,7 +72,10 @@ impl Instance {
     /// Whether this series was boosted, by this session or an earlier one.
     async fn is_boosted(&mut self, series: &sonarr::SeriesResource) -> bool {
         for tag in &mut self.boost_tags {
-            self.client.update_tag(tag).await;
+            // Resolved quietly: until the first series is boosted the tag
+            // legitimately does not exist yet, and warning about that on every
+            // poll would be crying wolf.
+            self.client.resolve_tag_quiet(tag).await;
             if series.is_tagged_with(tag) == Some(true) {
                 return true;
             }
@@ -563,7 +566,25 @@ impl Actor {
             }
         }
 
-        found.ok_or_else(|| anyhow!("series not found in Sonarr"))
+        found.ok_or_else(|| {
+            // Say which instances were actually consulted. The usual cause is
+            // a library that routes to no instance, or a series held by an
+            // instance the configuration never mentions.
+            let considered: Vec<&str> = self
+                .instances
+                .iter()
+                .filter(|i| i.serves(np.library.as_ref()))
+                .map(|i| i.name.as_str())
+                .collect();
+            let configured: Vec<&str> = self.instances.iter().map(|i| i.name.as_str()).collect();
+            anyhow!(
+                "series {:?} (library {:?}, user {:?}) not found in Sonarr; \
+                 searched instances {considered:?} out of {configured:?}",
+                np.series,
+                np.library,
+                np.user.name,
+            )
+        })
     }
 }
 
