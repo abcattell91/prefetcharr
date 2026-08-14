@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Support for multiple Sonarr instances. Configure one `[[sonarr]]` table per
+  instance; an optional per-instance `libraries` list routes sessions from a
+  given media server library to a given instance. A single `[sonarr]` table
+  keeps working unchanged.
+- Per-user quality boost via `[[sonarr.boost]]`. For the users a rule names, the
+  series is switched to a configured quality profile, tagged, and the next
+  `prefetch_num` episodes are monitored and searched individually — upgrading
+  episodes already on disk instead of only fetching missing ones. Episodes that
+  already meet the profile, are in the download queue, have not aired, or were
+  searched within `search_cooldown` are skipped. Reverting a boost is manual,
+  via the tag in Sonarr's series editor.
+- `dry_run` option that logs every intended change to Sonarr without applying
+  any of them.
+
+### Changed
+
+- Series carrying a boost tag are always searched episode-wise, even with
+  `request_seasons = true`, so an upgrade can never replace the file currently
+  being streamed.
+
 
 ## [1.6.2] - 2026-07-19
 

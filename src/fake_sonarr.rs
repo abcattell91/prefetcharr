@@ -19,6 +19,9 @@ struct SonarrState {
     episodes: Vec<Value>,
     tags: Vec<Value>,
     commands: Vec<Value>,
+    quality_profiles: Vec<Value>,
+    queue: Vec<Value>,
+    next_tag_id: i32,
 }
 
 impl FakeSonarr {
@@ -28,16 +31,21 @@ impl FakeSonarr {
             episodes: Vec::new(),
             tags: Vec::new(),
             commands: Vec::new(),
+            quality_profiles: Vec::new(),
+            queue: Vec::new(),
+            next_tag_id: 100,
         }));
 
         let router = Router::new()
             .route("/api", get(probe))
             .route("/api/v3/series", get(get_series))
             .route("/api/v3/series/{id}", put(put_series))
-            .route("/api/v3/tag", get(get_tags))
+            .route("/api/v3/tag", get(get_tags).post(post_tag))
             .route("/api/v3/episode", get(get_episodes))
             .route("/api/v3/episode/monitor", put(put_episode_monitor))
             .route("/api/v3/command", post(post_command))
+            .route("/api/v3/qualityprofile", get(get_quality_profiles))
+            .route("/api/v3/queue", get(get_queue))
             .with_state(state.clone());
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -68,6 +76,23 @@ impl FakeSonarr {
             .unwrap()
             .tags
             .push(json!({"id": id, "label": label}));
+    }
+
+    pub fn add_quality_profile(&self, profile: Value) {
+        self.state.lock().unwrap().quality_profiles.push(profile);
+    }
+
+    /// Put an episode into the download queue, as if a grab were in flight.
+    pub fn enqueue(&self, series_id: i32, episode_id: i32) {
+        self.state
+            .lock()
+            .unwrap()
+            .queue
+            .push(json!({"seriesId": series_id, "episodeId": episode_id}));
+    }
+
+    pub fn tags(&self) -> Vec<Value> {
+        self.state.lock().unwrap().tags.clone()
     }
 
     pub fn commands(&self) -> Vec<Value> {
@@ -104,8 +129,40 @@ pub fn make_series(id: i32, title: &str, tvdb_id: i32, seasons: &[Value]) -> Val
         "tvdbId": tvdb_id,
         "monitored": false,
         "monitorNewItems": "all",
+        "qualityProfileId": 1,
         "seasons": seasons,
     })
+}
+
+pub fn make_quality_profile(id: i32, name: &str, cutoff_format_score: i32) -> Value {
+    json!({
+        "id": id,
+        "name": name,
+        "cutoff": 1,
+        "cutoffFormatScore": cutoff_format_score,
+        "upgradeAllowed": true,
+    })
+}
+
+/// An episode backed by a file, as Sonarr reports it with
+/// `includeEpisodeFile=true`.
+pub fn make_episode_with_file(
+    id: i32,
+    series_id: i32,
+    season: i32,
+    episode: i32,
+    quality_cutoff_not_met: bool,
+    custom_format_score: i32,
+) -> Value {
+    let mut ep = make_episode(id, series_id, season, episode, true);
+    ep["episodeFile"] = json!({
+        "id": id,
+        "seriesId": series_id,
+        "seasonNumber": season,
+        "qualityCutoffNotMet": quality_cutoff_not_met,
+        "customFormatScore": custom_format_score,
+    });
+    ep
 }
 
 pub fn make_season(number: i32, monitored: bool, fully_aired: bool) -> Value {
@@ -130,6 +187,7 @@ pub fn make_episode(id: i32, series_id: i32, season: i32, episode: i32, has_file
         "episodeNumber": episode,
         "hasFile": has_file,
         "monitored": false,
+        "airDateUtc": "2020-01-01T00:00:00Z",
     })
 }
 
@@ -195,11 +253,56 @@ async fn get_tags(State(state): State<Arc<Mutex<SonarrState>>>) -> Json<Value> {
     Json(Value::Array(state.lock().unwrap().tags.clone()))
 }
 
+async fn post_tag(
+    State(state): State<Arc<Mutex<SonarrState>>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let mut state = state.lock().unwrap();
+    let id = state.next_tag_id;
+    state.next_tag_id += 1;
+    let tag = json!({"id": id, "label": body["label"]});
+    state.tags.push(tag.clone());
+    Json(tag)
+}
+
+async fn get_quality_profiles(State(state): State<Arc<Mutex<SonarrState>>>) -> Json<Value> {
+    Json(Value::Array(state.lock().unwrap().quality_profiles.clone()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueQuery {
+    series_ids: Option<i32>,
+}
+
+async fn get_queue(
+    State(state): State<Arc<Mutex<SonarrState>>>,
+    Query(q): Query<QueueQuery>,
+) -> Json<Value> {
+    let state = state.lock().unwrap();
+    let records: Vec<_> = state
+        .queue
+        .iter()
+        .filter(|r| {
+            q.series_ids
+                .is_none_or(|id| r["seriesId"].as_i64() == Some(i64::from(id)))
+        })
+        .cloned()
+        .collect();
+    Json(json!({
+        "page": 1,
+        "pageSize": 200,
+        "totalRecords": records.len(),
+        "records": records,
+    }))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EpisodeQuery {
     series_id: i32,
     season_number: Option<i32>,
+    include_episode_file: Option<bool>,
 }
 
 async fn get_episodes(
@@ -217,6 +320,15 @@ async fn get_episodes(
                 .is_none_or(|sn| e["seasonNumber"].as_i64() == Some(i64::from(sn)))
         })
         .cloned()
+        .map(|mut e| {
+            // Sonarr only embeds the file when it is asked to.
+            if q.include_episode_file != Some(true)
+                && let Some(e) = e.as_object_mut()
+            {
+                e.remove("episodeFile");
+            }
+            e
+        })
         .collect();
     Json(Value::Array(filtered))
 }

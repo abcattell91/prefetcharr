@@ -21,6 +21,7 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 
 use crate::{media_server::plex, util::once::Seen};
 
+mod boost;
 mod config;
 #[cfg(test)]
 mod fake_sonarr;
@@ -147,12 +148,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run(config: Config) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel(1);
 
-    let sonarr_client = sonarr::Client::new(&config.sonarr.url, &config.sonarr.api_key)
-        .context("Invalid connection parameters for Sonarr")?;
-    util::retry(config.connection_retries, async || {
-        sonarr_client.probe().await.context("Probing Sonarr failed")
-    })
-    .await?;
+    if config.dry_run {
+        warn!("Dry run: changes to Sonarr are logged but not applied");
+    }
+
+    let instances = sonarr_instances(&config).await?;
 
     info!("Start watching {} sessions", config.media_server.r#type);
     let interval = Duration::from_secs(config.interval);
@@ -220,11 +220,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let seen = Seen::default();
     let mut actor = process::Actor::new(
         rx,
-        sonarr_client,
+        instances,
         seen,
         config.prefetch_num,
         config.request_seasons,
-        config.sonarr.exclude_tag,
         queue,
         has_pending,
         pending_ttl,
@@ -233,6 +232,61 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let _ = tokio::join!(np_updates, actor.process(), client.run());
 
     Ok(())
+}
+
+/// Build and probe a client per configured Sonarr instance.
+async fn sonarr_instances(config: &Config) -> anyhow::Result<Vec<process::Instance>> {
+    let mut instances = Vec::new();
+
+    if config.sonarr.instances().is_empty() {
+        anyhow::bail!("no Sonarr instance configured");
+    }
+
+    for (index, sonarr) in config.sonarr.instances().iter().enumerate() {
+        let name = sonarr
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("sonarr-{}", index + 1));
+
+        let client = sonarr::Client::new(&sonarr.url, &sonarr.api_key, config.dry_run)
+            .with_context(|| format!("Invalid connection parameters for Sonarr {name}"))?;
+
+        util::retry(config.connection_retries, async || {
+            client
+                .probe()
+                .await
+                .with_context(|| format!("Probing Sonarr {name} failed"))
+        })
+        .await?;
+
+        // Surface a typo in a profile name at startup rather than at the first
+        // playback. Not fatal: the profile may simply not exist yet.
+        for boost in &sonarr.boost {
+            match client.resolve_quality_profile(&boost.quality_profile).await {
+                Ok(profile) => info!(
+                    instance = name,
+                    profile = profile.name,
+                    id = profile.id,
+                    "Boost quality profile resolved"
+                ),
+                Err(e) => warn!(
+                    instance = name,
+                    profile = boost.quality_profile,
+                    "Cannot resolve the boost quality profile: {e:#}"
+                ),
+            }
+        }
+
+        instances.push(process::Instance::new(
+            name,
+            client,
+            sonarr.libraries.clone(),
+            sonarr.exclude_tag.clone().map(sonarr::Tag::from),
+            sonarr.boost.iter().cloned().map(boost::Rule::from).collect(),
+        ));
+    }
+
+    Ok(instances)
 }
 
 fn enable_logging(log_dir: Option<&PathBuf>, level: Option<config::LogLevel>) {

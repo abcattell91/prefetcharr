@@ -2,12 +2,11 @@ use std::future::{Ready, ready};
 
 use tracing::debug;
 
-use crate::media_server::NowPlaying;
+use crate::{boost::matches_user, media_server::NowPlaying};
 
 pub fn users(users: &[String]) -> impl FnMut(&NowPlaying) -> Ready<bool> {
     move |np: &NowPlaying| {
-        let accept =
-            users.is_empty() || users.contains(&np.user.id) || users.contains(&np.user.name);
+        let accept = users.is_empty() || matches_user(users, &np.user);
         if !accept {
             debug!(
                 now_playing = ?np,

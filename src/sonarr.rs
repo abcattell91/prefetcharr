@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, anyhow};
 use reqwest::{
     Url,
@@ -14,14 +16,20 @@ pub enum Tag {
     Id(i32),
 }
 
+/// Stand-in for a tag ID that a dry run did not actually create.
+const DRY_RUN_TAG_ID: i32 = -1;
+
 #[derive(Clone)]
 pub struct Client {
     base_url: Url,
-    client: reqwest::Client,
+    http: reqwest::Client,
+    dry_run: bool,
 }
 
 impl Client {
-    pub fn new(base_url: &str, api_key: &str) -> Result<Self> {
+    /// With `dry_run` set, every request that would change something in Sonarr
+    /// is logged and skipped instead.
+    pub fn new(base_url: &str, api_key: &str, dry_run: bool) -> Result<Self> {
         let mut api_key = HeaderValue::from_str(api_key)?;
         api_key.set_sensitive(true);
         let mut headers = HeaderMap::new();
@@ -31,14 +39,39 @@ impl Client {
             HeaderValue::from_static("application/json"),
         );
 
-        let client = reqwest::Client::builder()
+        let http = reqwest::Client::builder()
             .default_headers(headers)
             .tls_backend_preconfigured(rustls::ClientConfig::with_platform_verifier()?)
             .build()?;
 
         let base_url = base_url.parse()?;
 
-        Ok(Self { base_url, client })
+        Ok(Self {
+            base_url,
+            http,
+            dry_run,
+        })
+    }
+
+    fn url(&self, path: &str) -> Result<Url> {
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .map_err(|()| anyhow!("url is relative"))?
+            .push("api")
+            .push("v3")
+            .extend(path.split('/'));
+        Ok(url)
+    }
+
+    /// Log a write instead of performing it. Returns `true` when the caller
+    /// should skip the request.
+    fn skip_write(&self, method: &str, url: &Url, body: &impl Serialize) -> bool {
+        if !self.dry_run {
+            return false;
+        }
+        let body = serde_json::to_string(body).unwrap_or_else(|e| format!("<unserializable: {e}>"));
+        info!(%method, %url, %body, "dry run: skipping write");
+        true
     }
 
     async fn get<Out: DeserializeOwned, Param: Serialize + ?Sized>(
@@ -46,13 +79,7 @@ impl Client {
         path: &str,
         params: Option<&Param>,
     ) -> Result<Out> {
-        let mut url = self.base_url.clone();
-        url.path_segments_mut()
-            .map_err(|()| anyhow!("url is relative"))?
-            .push("api")
-            .push("v3")
-            .extend(path.split('/'));
-        let get = self.client.get(url);
+        let get = self.http.get(self.url(path)?);
         let get = if let Some(params) = params {
             get.query(params)
         } else {
@@ -67,20 +94,17 @@ impl Client {
         url.path_segments_mut()
             .map_err(|()| anyhow!("url is relative"))?
             .push("api");
-        self.client.get(url).send().await?.error_for_status()?;
+        self.http.get(url).send().await?.error_for_status()?;
         Ok(())
     }
 
     pub async fn put_series(&self, series: &SeriesResource) -> Result<serde_json::Value> {
-        let mut url = self.base_url.clone();
-        url.path_segments_mut()
-            .map_err(|()| anyhow!("url is relative"))?
-            .push("api")
-            .push("v3")
-            .push("series")
-            .push(&series.id.to_string());
+        let url = self.url(&format!("series/{}", series.id))?;
+        if self.skip_write("PUT", &url, series) {
+            return Ok(json!({}));
+        }
         let response = self
-            .client
+            .http
             .put(url)
             .json(series)
             .send()
@@ -134,6 +158,90 @@ impl Client {
     }
 
     #[instrument(skip(self))]
+    pub async fn create_tag(&self, label: &str) -> Result<i32> {
+        let url = self.url("tag")?;
+        let body = json!({ "label": label });
+        if self.skip_write("POST", &url, &body) {
+            // Sonarr assigns the real id. Hand back a placeholder so the rest
+            // of the dry run still reports what it would do.
+            warn!(label, "dry run: using a placeholder ID for the new tag");
+            return Ok(DRY_RUN_TAG_ID);
+        }
+        let response = self
+            .http
+            .post(url)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        let tag: TagResource = response.json().await?;
+        info!(id = tag.id, label, "Created tag");
+        Ok(tag.id)
+    }
+
+    /// Resolve a tag by label, creating it if Sonarr doesn't know it yet.
+    #[instrument(skip(self))]
+    pub async fn resolve_or_create_tag(&self, label: &str) -> Result<i32> {
+        match self.resolve_tag(label).await {
+            Ok(id) => Ok(id),
+            Err(_) => self
+                .create_tag(label)
+                .await
+                .with_context(|| format!("creating tag {label}")),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn quality_profiles(&self) -> Result<Vec<QualityProfileResource>> {
+        let profiles = self
+            .get::<Value, ()>("qualityprofile", None)
+            .await?
+            .as_array()
+            .context("not an array")?
+            .iter()
+            .filter_map(|p| {
+                serde_json::from_value(p.clone())
+                    .inspect_err(|e| debug!(profile=?p, "ignoring malformed quality profile: {e}"))
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        Ok(profiles)
+    }
+
+    /// Look up a quality profile by name. Sonarr profile names are unique but
+    /// not case-sensitive to the user, so match accordingly.
+    #[instrument(skip(self))]
+    pub async fn resolve_quality_profile(&self, name: &str) -> Result<QualityProfileResource> {
+        self.quality_profiles()
+            .await
+            .context("retrieving quality profiles")?
+            .into_iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+            .with_context(|| format!("no quality profile named {name}"))
+    }
+
+    /// Episode IDs of the series that are already being downloaded.
+    ///
+    /// Searching for these again would duplicate a grab that is already in
+    /// flight and waste indexer requests.
+    #[instrument(skip(self))]
+    pub async fn queued_episode_ids(&self, series_id: i32) -> Result<HashSet<i32>> {
+        let queue: QueueResource = self
+            .get(
+                "queue",
+                Some(&[
+                    ("seriesIds", series_id.to_string()),
+                    ("includeEpisode", "true".to_string()),
+                    ("pageSize", "200".to_string()),
+                ]),
+            )
+            .await
+            .context("error fetching the download queue")?;
+
+        Ok(queue.records.into_iter().filter_map(|r| r.episode_id).collect())
+    }
+
+    #[instrument(skip(self))]
     pub async fn update_tag(&self, tag: &mut Tag) {
         let Tag::Label(label) = tag else { return };
         match self.resolve_tag(label).await {
@@ -150,21 +258,19 @@ impl Client {
         episode_ids: Vec<i32>,
         monitored: bool,
     ) -> Result<serde_json::Value> {
-        let mut url = self.base_url.clone();
-        url.path_segments_mut()
-            .map_err(|()| anyhow!("url is relative"))?
-            .push("api")
-            .push("v3")
-            .push("episode")
-            .push("monitor");
+        let url = self.url("episode/monitor")?;
 
         let request = EpisodeMonitoredResource {
             episode_ids,
             monitored,
         };
 
+        if self.skip_write("PUT", &url, &request) {
+            return Ok(json!([]));
+        }
+
         let response = self
-            .client
+            .http
             .put(url)
             .json(&request)
             .send()
@@ -175,14 +281,6 @@ impl Client {
     }
 
     pub async fn update_episode_monitoring(&self, episodes: &[EpisodeResource]) -> Result<()> {
-        let mut url = self.base_url.clone();
-        url.path_segments_mut()
-            .map_err(|()| anyhow!("url is relative"))?
-            .push("api")
-            .push("v3")
-            .push("episode")
-            .push("monitor");
-
         let monitored_ids: Vec<_> = episodes
             .iter()
             .filter_map(|e| e.monitored.then_some(e.id))
@@ -204,10 +302,20 @@ impl Client {
         Ok(())
     }
 
-    async fn episodes(&self, series: &SeriesResource) -> Result<Vec<EpisodeResource>> {
-        self.get("episode", Some(&[("seriesId", series.id)]))
-            .await
-            .context("error fetching episodes")
+    async fn episodes(
+        &self,
+        series: &SeriesResource,
+        include_episode_file: bool,
+    ) -> Result<Vec<EpisodeResource>> {
+        self.get(
+            "episode",
+            Some(&[
+                ("seriesId", series.id.to_string()),
+                ("includeEpisodeFile", include_episode_file.to_string()),
+            ]),
+        )
+        .await
+        .context("error fetching episodes")
     }
 
     async fn episodes_season(
@@ -232,8 +340,9 @@ impl Client {
         season_start: i32,
         episode_start: i32,
         num: usize,
+        include_episode_file: bool,
     ) -> Result<Vec<EpisodeResource>> {
-        let episodes = self.episodes(series).await?;
+        let episodes = self.episodes(series, include_episode_file).await?;
         let episodes = episode_window(season_start, episode_start, num, episodes);
 
         Ok(episodes)
@@ -314,15 +423,14 @@ impl Client {
     }
 
     async fn command(&self, cmd: Value) -> std::result::Result<Value, anyhow::Error> {
-        let mut url = self.base_url.clone();
-        url.path_segments_mut()
-            .map_err(|()| anyhow!("url is relative"))?
-            .push("api")
-            .push("v3")
-            .push("command");
+        let url = self.url("command")?;
+
+        if self.skip_write("POST", &url, &cmd) {
+            return Ok(json!({}));
+        }
 
         let response = self
-            .client
+            .http
             .post(url)
             .json(&cmd)
             .send()
@@ -382,8 +490,57 @@ pub struct EpisodeResource {
     pub episode_number: i32,
     pub has_file: bool,
     pub monitored: bool,
+    /// Only present when requested with `includeEpisodeFile`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_file: Option<EpisodeFileResource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub air_date_utc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_search_time: Option<String>,
     #[serde(flatten)]
     other: serde_json::Value,
+}
+
+/// The file backing an episode.
+///
+/// `quality_cutoff_not_met` lives here rather than on the episode, which is
+/// why the episode listing has to be requested with `includeEpisodeFile`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpisodeFileResource {
+    #[serde(default)]
+    pub quality_cutoff_not_met: bool,
+    #[serde(default)]
+    pub custom_format_score: Option<i32>,
+    #[serde(flatten)]
+    other: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityProfileResource {
+    pub id: i32,
+    pub name: String,
+    /// Target for "Upgrade Until Custom Format Score", independent of the
+    /// quality cutoff
+    #[serde(default)]
+    pub cutoff_format_score: Option<i32>,
+    #[serde(default)]
+    pub upgrade_allowed: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueResource {
+    #[serde(default)]
+    records: Vec<QueueRecordResource>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueRecordResource {
+    #[serde(default)]
+    episode_id: Option<i32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -434,6 +591,10 @@ pub struct SeriesResource {
     pub title: Option<String>,
     pub tvdb_id: i32,
     pub monitored: bool,
+    // Always sent by Sonarr; defaulted so a series entry that somehow omits it
+    // is still usable rather than being dropped as malformed.
+    #[serde(default)]
+    pub quality_profile_id: i32,
     // optional for v3 compatibility
     pub monitor_new_items: Option<NewItemMonitorTypes>,
     pub seasons: Vec<SeasonResource>,
@@ -470,6 +631,33 @@ impl SeriesResource {
         let Tag::Id(id) = tag else { return None };
         Some(self.tags.as_ref()?.contains(id))
     }
+
+    /// Switch the series to a quality profile and mark it as boosted.
+    ///
+    /// Existing tags are preserved — the boost tag is what lets the user find
+    /// and mass-revert boosted series in Sonarr's series editor later.
+    /// Returns whether anything actually changed.
+    pub fn apply_boost(&mut self, quality_profile_id: i32, tag_id: i32) -> bool {
+        let mut changed = false;
+
+        if self.quality_profile_id != quality_profile_id {
+            self.quality_profile_id = quality_profile_id;
+            changed = true;
+        }
+
+        let tags = self.tags.get_or_insert_with(Vec::new);
+        if !tags.contains(&tag_id) {
+            tags.push(tag_id);
+            changed = true;
+        }
+
+        if !self.monitored {
+            self.monitored = true;
+            changed = true;
+        }
+
+        changed
+    }
 }
 
 #[cfg(test)]
@@ -494,7 +682,7 @@ mod test {
                 then.json_body(serde_json::json!([]));
             })
             .await;
-        let client = super::Client::new(&server.url("/pathprefix"), "secret")?;
+        let client = super::Client::new(&server.url("/pathprefix"), "secret", false)?;
 
         let _ = client.series().await?;
 
@@ -522,7 +710,7 @@ mod test {
                 ));
             })
             .await;
-        let client = super::Client::new(&server.url("/pathprefix"), "secret")?;
+        let client = super::Client::new(&server.url("/pathprefix"), "secret", false)?;
 
         let series = client.series().await?;
         assert_eq!(series[0].id, 1234);
@@ -559,7 +747,7 @@ mod test {
                 ));
             })
             .await;
-        let client = super::Client::new(&server.url("/pathprefix"), "secret")?;
+        let client = super::Client::new(&server.url("/pathprefix"), "secret", false)?;
 
         let series = client.series().await?;
         assert_eq!(series.len(), 2);
@@ -592,7 +780,7 @@ mod test {
                 ));
             })
             .await;
-        let client = super::Client::new(&server.url("/pathprefix"), "secret")?;
+        let client = super::Client::new(&server.url("/pathprefix"), "secret", false)?;
 
         let series = client.series().await?;
         assert_eq!(series.len(), 1);
@@ -624,7 +812,7 @@ mod test {
                 ));
             })
             .await;
-        let client = super::Client::new(&server.url("/pathprefix"), "secret")?;
+        let client = super::Client::new(&server.url("/pathprefix"), "secret", false)?;
 
         let series = client.series().await?;
         assert_eq!(series.len(), 1);
@@ -645,7 +833,7 @@ mod test {
                 then.json_body(serde_json::json!([]));
             })
             .await;
-        let client = super::Client::new(&server.url("/pathprefix"), "secret")?;
+        let client = super::Client::new(&server.url("/pathprefix"), "secret", false)?;
 
         let series = client.series().await?;
         assert_eq!(series.len(), 0);
@@ -665,6 +853,7 @@ mod test {
             title: Some("TestShow".to_string()),
             tvdb_id: 5678,
             monitored: false,
+            quality_profile_id: 1,
             monitor_new_items: Some(NewItemMonitorTypes::All),
             seasons: vec![],
             tags: Some(vec![1]),
@@ -681,6 +870,7 @@ mod test {
                             "title": "TestShow",
                             "tvdbId": 5678,
                             "monitored": false,
+                            "qualityProfileId": 1,
                             "monitorNewItems": "all",
                             "seasons": [],
                             "tags": [1]
@@ -689,7 +879,7 @@ mod test {
                 then.json_body(json!({}));
             })
             .await;
-        let client = super::Client::new(&server.url("/pathprefix"), "secret")?;
+        let client = super::Client::new(&server.url("/pathprefix"), "secret", false)?;
 
         client.put_series(&series).await?;
 
@@ -723,6 +913,7 @@ mod test {
             title: Some("TestShow".to_string()),
             tvdb_id: 5678,
             monitored: false,
+            quality_profile_id: 1,
             monitor_new_items: Some(NewItemMonitorTypes::All),
             seasons: vec![season],
             tags: None,
@@ -742,7 +933,7 @@ mod test {
             })
             .await;
 
-        let client = super::Client::new(&server.url("/pathprefix"), "secret")?;
+        let client = super::Client::new(&server.url("/pathprefix"), "secret", false)?;
 
         let series_mock = server
             .mock_async(|when, then| {
@@ -753,6 +944,7 @@ mod test {
                         "title": "TestShow",
                         "tvdbId": 5678,
                         "monitored": false,
+                        "qualityProfileId": 1,
                         "monitorNewItems": "all",
                         "seasons": [{
                             "seasonNumber": 1,
@@ -803,6 +995,7 @@ mod test {
             title: Some("TestShow".to_string()),
             tvdb_id: 5678,
             monitored: false,
+            quality_profile_id: 1,
             monitor_new_items: Some(NewItemMonitorTypes::All),
             seasons: vec![season],
             tags: None,
@@ -844,7 +1037,7 @@ mod test {
             })
             .await;
 
-        let client = super::Client::new(&server.url("/pathprefix"), "secret")?;
+        let client = super::Client::new(&server.url("/pathprefix"), "secret", false)?;
 
         client.search_season(&mut series, 1).await?;
 
@@ -1055,7 +1248,7 @@ mod test {
             })
             .await;
 
-        let client = super::Client::new(&server.url("/pathprefix"), "secret")?;
+        let client = super::Client::new(&server.url("/pathprefix"), "secret", false)?;
 
         {
             let mut tag = Tag::from(String::from("tag1"));
@@ -1093,7 +1286,7 @@ mod test {
             })
             .await;
 
-        let client = super::Client::new(&server.url("/pathprefix"), "secret")?;
+        let client = super::Client::new(&server.url("/pathprefix"), "secret", false)?;
 
         {
             let mut tag = Tag::from(String::from("tag1"));
@@ -1117,7 +1310,7 @@ mod test {
             })
             .await;
 
-        let client = super::Client::new(&server.url("/pathprefix"), "secret")?;
+        let client = super::Client::new(&server.url("/pathprefix"), "secret", false)?;
 
         {
             let mut tag = Tag::from(String::from("tag1"));
@@ -1137,6 +1330,9 @@ mod test {
             episode_number: 1,
             has_file: false,
             monitored: false,
+            episode_file: None,
+            air_date_utc: None,
+            last_search_time: None,
             other: Value::default(),
         }
     }

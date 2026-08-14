@@ -7,15 +7,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::anyhow;
+use anyhow::{Context as _, anyhow};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    Message,
+    Message, boost,
     media_server::{EpisodeRef, NowPlaying, PrefetchKey, Queue, Series},
     sonarr,
-    util::once::Seen,
+    util::{once::Seen, time},
 };
 
 struct Pending {
@@ -26,13 +26,87 @@ struct Pending {
     last_seen: Instant,
 }
 
+/// A configured Sonarr instance and the rules that apply to it.
+pub struct Instance {
+    pub name: String,
+    pub client: sonarr::Client,
+    /// Media server libraries served by this instance. Empty means any.
+    pub libraries: Vec<String>,
+    pub exclude_tag: Option<sonarr::Tag>,
+    pub boost: Vec<boost::Rule>,
+    /// The tags of `boost`, resolved lazily, to recognise series that a
+    /// previous session already boosted.
+    pub boost_tags: Vec<sonarr::Tag>,
+}
+
+impl Instance {
+    pub fn new(
+        name: String,
+        client: sonarr::Client,
+        libraries: Vec<String>,
+        exclude_tag: Option<sonarr::Tag>,
+        boost: Vec<boost::Rule>,
+    ) -> Self {
+        let mut labels: Vec<&str> = boost.iter().map(|r| r.tag.as_str()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        let boost_tags = labels
+            .into_iter()
+            .map(|l| sonarr::Tag::from(l.to_string()))
+            .collect();
+
+        Self {
+            name,
+            client,
+            libraries,
+            exclude_tag,
+            boost,
+            boost_tags,
+        }
+    }
+
+    fn serves(&self, library: Option<&String>) -> bool {
+        self.libraries.is_empty() || library.is_some_and(|l| self.libraries.contains(l))
+    }
+
+    /// Whether this series was boosted, by this session or an earlier one.
+    async fn is_boosted(&mut self, series: &sonarr::SeriesResource) -> bool {
+        for tag in &mut self.boost_tags {
+            self.client.update_tag(tag).await;
+            if series.is_tagged_with(tag) == Some(true) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Outcome of the fetch pass, kept separate from its error so the upgrade pass
+/// can still run and so the play queue learns about missing episodes either way.
+struct Fetched {
+    /// Episodes of the window that Sonarr has no file for
+    missing: Vec<EpisodeRef>,
+    /// Episode IDs already handed to an `EpisodeSearch`
+    searched_ids: HashSet<i32>,
+    result: anyhow::Result<()>,
+}
+
+impl Default for Fetched {
+    fn default() -> Self {
+        Self {
+            missing: Vec::new(),
+            searched_ids: HashSet::new(),
+            result: Ok(()),
+        }
+    }
+}
+
 pub struct Actor {
     rx: mpsc::Receiver<Message>,
-    sonarr_client: sonarr::Client,
+    instances: Vec<Instance>,
     seen: Seen<PrefetchKey>,
     prefetch_num: usize,
     request_seasons: bool,
-    exclude_tag: Option<sonarr::Tag>,
     queue: Option<Arc<dyn Queue + Send + Sync>>,
     pending: HashMap<String, Pending>,
     has_pending: Arc<AtomicBool>,
@@ -43,23 +117,20 @@ impl Actor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         rx: mpsc::Receiver<Message>,
-        sonarr_client: sonarr::Client,
+        instances: Vec<Instance>,
         seen: Seen<PrefetchKey>,
         prefetch_num: usize,
         request_seasons: bool,
-        exclude_tag: Option<String>,
         queue: Option<Arc<dyn Queue + Send + Sync>>,
         has_pending: Arc<AtomicBool>,
         pending_ttl: Duration,
     ) -> Self {
-        let exclude_tag = exclude_tag.map(sonarr::Tag::from);
         Self {
             rx,
-            sonarr_client,
+            instances,
             seen,
             prefetch_num,
             request_seasons,
-            exclude_tag,
             queue,
             pending: HashMap::new(),
             has_pending,
@@ -124,49 +195,164 @@ impl Actor {
             return Ok(None);
         }
 
-        // find series
-        let mut series = self.find_series(np).await?;
+        // find the instance holding the series, and the series itself
+        let (index, mut series) = self.find_series(np).await?;
 
-        info!(title = series.title.clone().unwrap_or_else(|| "?".to_string()), now_playing = ?np);
+        let (client, rule, already_boosted) = {
+            let instance = &mut self.instances[index];
+            let client = instance.client.clone();
 
-        // Resolve and match exclusion tag
-        if let Some(exclude_tag) = &mut self.exclude_tag {
-            self.sonarr_client.update_tag(exclude_tag).await;
-            if let Some(true) = series.is_tagged_with(exclude_tag) {
-                info!("excluded via tag");
-                return Ok(None);
+            info!(
+                instance = instance.name,
+                title = series.title.clone().unwrap_or_else(|| "?".to_string()),
+                now_playing = ?np
+            );
+
+            // Resolve and match exclusion tag
+            if let Some(exclude_tag) = &mut instance.exclude_tag {
+                client.update_tag(exclude_tag).await;
+                if let Some(true) = series.is_tagged_with(exclude_tag) {
+                    info!("excluded via tag");
+                    return Ok(None);
+                }
             }
-        }
+
+            let rule = instance
+                .boost
+                .iter()
+                .find(|rule| rule.matches(&np.user))
+                .cloned();
+
+            // Checked even for users without a rule: the series may carry a
+            // boosted profile from someone else's session.
+            let already_boosted = instance.is_boosted(&series).await;
+
+            (client, rule, already_boosted)
+        };
 
         // Season 0 contains specials without any particular order.
         if np.season == 0 {
             return Ok(None);
         }
 
-        // fetch n next episodes
-        let episodes = self
-            .sonarr_client
-            .episode_range(&series, np.season, np.episode, self.prefetch_num)
-            .await?;
+        // The quality profile has to be in place before any episode listing is
+        // read: `qualityCutoffNotMet` is evaluated against the series' current
+        // profile, so reading first would report every existing file as good
+        // enough and nothing would ever be upgraded.
+        let boost = match &rule {
+            Some(rule) => Some(self.apply_boost(&client, &mut series, rule).await?),
+            None => None,
+        };
+
+        // A boosted series must never be searched season-wise: Sonarr replaces
+        // files in place on upgrade, and a season pack covers the episode being
+        // streamed right now. This holds for every viewer of the series, not
+        // just the one whose rule boosted it.
+        let boosted_series = boost.is_some() || already_boosted;
+        if boosted_series && self.request_seasons {
+            debug!("boosted series, searching episodes instead of seasons");
+        }
+        let request_seasons = self.request_seasons && !boosted_series;
+
+        let searched = self
+            .fetch_missing(&client, &mut series, np, request_seasons)
+            .await;
+
+        // The upgrade pass runs even when fetching failed — the two cover
+        // different episodes and one shouldn't mask the other.
+        let upgrade = match (&rule, &boost) {
+            (Some(rule), Some(boost)) => {
+                self.upgrade_existing(&client, &series, np, rule, boost, &searched.searched_ids)
+                    .await
+            }
+            _ => Ok(()),
+        };
+
+        searched.result?;
+        upgrade?;
+
+        Ok(Some(searched.missing))
+    }
+
+    /// Switch the series onto the boosted quality profile and tag it.
+    async fn apply_boost(
+        &self,
+        client: &sonarr::Client,
+        series: &mut sonarr::SeriesResource,
+        rule: &boost::Rule,
+    ) -> anyhow::Result<sonarr::QualityProfileResource> {
+        let profile = client
+            .resolve_quality_profile(&rule.quality_profile)
+            .await
+            .with_context(|| format!("resolving quality profile {}", rule.quality_profile))?;
+
+        if profile.upgrade_allowed == Some(false) {
+            warn!(
+                profile = profile.name,
+                "quality profile has upgrades disabled, \
+                 Sonarr will not replace any existing file"
+            );
+        }
+
+        let tag_id = client.resolve_or_create_tag(&rule.tag).await?;
+
+        if series.apply_boost(profile.id, tag_id) {
+            info!(
+                profile = profile.name,
+                profile_id = profile.id,
+                tag = rule.tag,
+                "Boosting series quality"
+            );
+            client.put_series(series).await?;
+        }
+
+        Ok(profile)
+    }
+
+    /// The pre-existing behaviour: make sure the next `prefetch_num` episodes
+    /// exist at all, fetching whole seasons when configured to.
+    async fn fetch_missing(
+        &self,
+        client: &sonarr::Client,
+        series: &mut sonarr::SeriesResource,
+        np: &NowPlaying,
+        request_seasons: bool,
+    ) -> Fetched {
+        let mut fetched = Fetched::default();
+
+        let episodes = match client
+            .episode_range(series, np.season, np.episode, self.prefetch_num, false)
+            .await
+        {
+            Ok(episodes) => episodes,
+            Err(e) => {
+                fetched.result = Err(e);
+                return fetched;
+            }
+        };
 
         if episodes.len() < self.prefetch_num {
             info!("Not as many episodes announced, monitor new items instead");
-            self.sonarr_client
-                .monitor_unannounced_episodes(&mut series)
-                .await?;
+            if let Err(e) = client.monitor_unannounced_episodes(series).await {
+                fetched.result = Err(e);
+                return fetched;
+            }
         } else if !series.monitored {
             series.monitored = true;
-            self.sonarr_client.put_series(&series).await?;
+            if let Err(e) = client.put_series(series).await {
+                fetched.result = Err(e);
+                return fetched;
+            }
         }
 
         let missing_episodes: Vec<_> = episodes.into_iter().filter(|e| !e.has_file).collect();
-        let pairs: Vec<EpisodeRef> = missing_episodes
+        fetched.missing = missing_episodes
             .iter()
             .map(|e| EpisodeRef::new(e.season_number, e.episode_number))
             .collect();
         let mut episodes_to_search = Vec::new();
 
-        if self.request_seasons {
+        if request_seasons {
             let mut seasons_to_search: HashSet<i32> = HashSet::new();
 
             for e in missing_episodes {
@@ -185,17 +371,13 @@ impl Actor {
 
             let mut error = false;
             for season_num in season_numbers {
-                if let Err(err) = self
-                    .sonarr_client
-                    .search_season(&mut series, season_num)
-                    .await
-                {
+                if let Err(err) = client.search_season(series, season_num).await {
                     error!("skip searching for season {season_num}: {err:#}");
                     error = true;
                 }
             }
             if error {
-                return Err(anyhow!("failed searching one or more seasons"));
+                fetched.result = Err(anyhow!("failed searching one or more seasons"));
             }
         } else {
             episodes_to_search = missing_episodes;
@@ -209,15 +391,70 @@ impl Actor {
                     e
                 })
                 .collect();
-            self.sonarr_client
-                .update_episode_monitoring(&episodes_to_search)
-                .await?;
-            self.sonarr_client
-                .search_episodes(&episodes_to_search)
-                .await?;
+            fetched
+                .searched_ids
+                .extend(episodes_to_search.iter().map(|e| e.id));
+
+            if let Err(e) = client.update_episode_monitoring(&episodes_to_search).await {
+                fetched.result = Err(e);
+            } else if let Err(e) = client.search_episodes(&episodes_to_search).await {
+                fetched.result = Err(e);
+            }
         }
 
-        Ok(Some(pairs))
+        fetched
+    }
+
+    /// Search for upgrades of the next few episodes, including ones already on
+    /// disk. Only ever searches individual episodes.
+    async fn upgrade_existing(
+        &self,
+        client: &sonarr::Client,
+        series: &sonarr::SeriesResource,
+        np: &NowPlaying,
+        rule: &boost::Rule,
+        profile: &sonarr::QualityProfileResource,
+        already_searched: &HashSet<i32>,
+    ) -> anyhow::Result<()> {
+        let episodes = client
+            .episode_range(series, np.season, np.episode, rule.prefetch_num, true)
+            .await
+            .context("fetching episodes to upgrade")?;
+
+        let queued = client
+            .queued_episode_ids(series.id)
+            .await
+            .unwrap_or_else(|e| {
+                // Not fatal: the worst case is a duplicate grab, which Sonarr
+                // rejects on its own.
+                warn!("cannot read the download queue: {e:#}");
+                HashSet::new()
+            });
+
+        let now = time::now().and_then(|n| i64::try_from(n).ok()).unwrap_or(0);
+        let candidates =
+            boost::select_upgrades(&episodes, profile, &queued, now, rule.search_cooldown);
+
+        let to_search: Vec<_> = candidates
+            .into_iter()
+            .filter(|e| !already_searched.contains(&e.id))
+            .map(|mut e| {
+                // A search only grabs for a monitored episode, and in a
+                // prefetcharr library plenty of upcoming episodes are not.
+                e.monitored = true;
+                e
+            })
+            .collect();
+
+        if to_search.is_empty() {
+            info!("Nothing to upgrade");
+            return Ok(());
+        }
+
+        client.update_episode_monitoring(&to_search).await?;
+        client.search_episodes(&to_search).await?;
+
+        Ok(())
     }
 
     fn refresh_pending(&mut self, np: &NowPlaying) {
@@ -277,19 +514,56 @@ impl Actor {
             .store(!self.pending.is_empty(), Ordering::Relaxed);
     }
 
+    /// Locate the series among the configured Sonarr instances.
+    ///
+    /// Only instances serving the session's library are considered; among
+    /// those, the first one that knows the series wins. A series present on
+    /// several instances is reported so the ambiguity can be resolved with
+    /// per-instance `libraries`.
     async fn find_series(
         &mut self,
         np: &NowPlaying,
-    ) -> Result<sonarr::SeriesResource, anyhow::Error> {
-        let series = self.sonarr_client.series().await?;
-        let series = series
-            .into_iter()
-            .find(|s| match &np.series {
+    ) -> Result<(usize, sonarr::SeriesResource), anyhow::Error> {
+        let mut found: Option<(usize, sonarr::SeriesResource)> = None;
+
+        for (index, instance) in self.instances.iter().enumerate() {
+            if !instance.serves(np.library.as_ref()) {
+                debug!(
+                    instance = instance.name,
+                    library = ?np.library,
+                    "instance does not serve this library"
+                );
+                continue;
+            }
+
+            let series = match instance.client.series().await {
+                Ok(series) => series,
+                Err(e) => {
+                    // One unreachable instance must not hide a series held by
+                    // another.
+                    error!(instance = instance.name, "cannot list series: {e:#}");
+                    continue;
+                }
+            };
+
+            let Some(series) = series.into_iter().find(|s| match &np.series {
                 Series::Title(t) => s.title.as_ref() == Some(t),
                 Series::Tvdb(i) => &s.tvdb_id == i,
-            })
-            .ok_or_else(|| anyhow!("series not found in Sonarr"))?;
-        Ok(series)
+            }) else {
+                continue;
+            };
+
+            match &found {
+                None => found = Some((index, series)),
+                Some((first, _)) => warn!(
+                    instance = instance.name,
+                    chosen = self.instances[*first].name,
+                    "series exists on more than one instance, using the first match"
+                ),
+            }
+        }
+
+        found.ok_or_else(|| anyhow!("series not found in Sonarr"))
     }
 }
 
@@ -306,8 +580,12 @@ mod test {
     use tokio::sync::mpsc;
 
     use crate::{
-        fake_sonarr::{FakeSonarr, make_episode, make_season, make_series},
-        media_server::{EpisodeRef, NowPlaying, Queue, Series, test::np_default},
+        boost,
+        fake_sonarr::{
+            FakeSonarr, make_episode, make_episode_with_file, make_quality_profile, make_season,
+            make_series,
+        },
+        media_server::{EpisodeRef, NowPlaying, Queue, Series, User, test::np_default},
         util::once,
     };
 
@@ -348,6 +626,54 @@ mod test {
         }
     }
 
+    /// A single Sonarr instance serving every library, with no rules attached.
+    fn instance(fake: &FakeSonarr) -> super::Instance {
+        instance_with(fake, Vec::new(), None, Vec::new())
+    }
+
+    fn instance_with(
+        fake: &FakeSonarr,
+        libraries: Vec<&str>,
+        exclude_tag: Option<String>,
+        boost: Vec<boost::Rule>,
+    ) -> super::Instance {
+        super::Instance::new(
+            "test".to_string(),
+            crate::sonarr::Client::new(fake.url(), "secret", false).unwrap(),
+            libraries.into_iter().map(ToString::to_string).collect(),
+            exclude_tag.map(crate::sonarr::Tag::from),
+            boost,
+        )
+    }
+
+    fn boost_rule(users: &[&str], quality_profile: &str, prefetch_num: usize) -> boost::Rule {
+        boost::Rule::from(crate::config::Boost {
+            users: users.iter().map(ToString::to_string).collect(),
+            quality_profile: quality_profile.to_string(),
+            prefetch_num,
+            tag: "hq-boosted".to_string(),
+            search_cooldown: 0,
+        })
+    }
+
+    fn actor_with_instances(
+        instances: Vec<super::Instance>,
+        prefetch_num: usize,
+        request_seasons: bool,
+    ) -> super::Actor {
+        let (_tx, rx) = mpsc::channel(1);
+        super::Actor::new(
+            rx,
+            instances,
+            once::Seen::default(),
+            prefetch_num,
+            request_seasons,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_secs(3600),
+        )
+    }
+
     fn actor_with_queue(
         fake: &FakeSonarr,
         prefetch_num: usize,
@@ -356,14 +682,12 @@ mod test {
         pending_ttl: Duration,
     ) -> super::Actor {
         let (_tx, rx) = mpsc::channel(1);
-        let sonarr = crate::sonarr::Client::new(fake.url(), "secret").unwrap();
         super::Actor::new(
             rx,
-            sonarr,
+            vec![instance(fake)],
             once::Seen::default(),
             prefetch_num,
             false,
-            None,
             Some(queue as Arc<dyn Queue + Send + Sync>),
             has_pending,
             pending_ttl,
@@ -394,7 +718,7 @@ mod test {
     }
 
     fn actor(fake: &FakeSonarr, prefetch_num: usize, request_seasons: bool) -> super::Actor {
-        actor_with_tag(fake, prefetch_num, request_seasons, None)
+        actor_with_instances(vec![instance(fake)], prefetch_num, request_seasons)
     }
 
     fn actor_with_tag(
@@ -403,19 +727,19 @@ mod test {
         request_seasons: bool,
         exclude_tag: Option<String>,
     ) -> super::Actor {
-        let (_tx, rx) = mpsc::channel(1);
-        let sonarr = crate::sonarr::Client::new(fake.url(), "secret").unwrap();
-        super::Actor::new(
-            rx,
-            sonarr,
-            once::Seen::default(),
-            prefetch_num,
-            request_seasons,
-            exclude_tag,
-            None,
-            Arc::new(AtomicBool::new(false)),
-            Duration::from_secs(3600),
-        )
+        let instance = instance_with(fake, Vec::new(), exclude_tag, Vec::new());
+        actor_with_instances(vec![instance], prefetch_num, request_seasons)
+    }
+
+    /// An actor whose only instance boosts `users` onto `quality_profile`.
+    fn actor_with_boost(
+        fake: &FakeSonarr,
+        prefetch_num: usize,
+        request_seasons: bool,
+        rule: boost::Rule,
+    ) -> super::Actor {
+        let instance = instance_with(fake, Vec::new(), None, vec![rule]);
+        actor_with_instances(vec![instance], prefetch_num, request_seasons)
     }
 
     // Prefetching from mid-season triggers season searches for the current and next season
@@ -1030,6 +1354,476 @@ mod test {
 
         // No has_pending observable here, but no panic either.
         // The Sonarr search still happened, and that's covered by other tests.
+        Ok(())
+    }
+
+    fn boosted_user() -> User {
+        User {
+            name: "Boosted".to_string(),
+            id: "42".to_string(),
+        }
+    }
+
+    /// A library where every episode is on disk but below the boosted
+    /// profile's cutoff.
+    fn low_quality_episodes() -> Vec<serde_json::Value> {
+        let mut eps = Vec::new();
+        for s in 1..=2 {
+            for e in 1..=8 {
+                eps.push(make_episode_with_file(s * 10 + e, 1234, s, e, true, 0));
+            }
+        }
+        eps
+    }
+
+    /// Same library, but every file already satisfies the profile.
+    fn high_quality_episodes() -> Vec<serde_json::Value> {
+        let mut eps = Vec::new();
+        for s in 1..=2 {
+            for e in 1..=8 {
+                eps.push(make_episode_with_file(s * 10 + e, 1234, s, e, false, 1000));
+            }
+        }
+        eps
+    }
+
+    fn boosted_np() -> NowPlaying {
+        NowPlaying {
+            series: Series::Title("TestShow".to_string()),
+            episode: 5,
+            season: 1,
+            user: boosted_user(),
+            ..np_default()
+        }
+    }
+
+    // A boosted user on a low-quality series gets the profile switched, the tag
+    // applied, the next N episodes monitored and one EpisodeSearch
+    #[tokio::test]
+    #[test_log::test]
+    async fn boost_upgrades_existing_files() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(low_quality_episodes());
+        fake.add_quality_profile(make_quality_profile(9, "HQ-1080p", 1000));
+
+        actor_with_boost(&fake, 2, true, boost_rule(&["42"], "HQ-1080p", 2))
+            .prefetch(boosted_np())
+            .await?;
+
+        let series = fake.series_state(1234);
+        assert_eq!(series["qualityProfileId"].as_i64(), Some(9));
+        // The tag did not exist and must have been created
+        assert_eq!(fake.tags().len(), 1);
+        let tag_id = fake.tags()[0]["id"].as_i64().unwrap();
+        assert_eq!(fake.tags()[0]["label"].as_str(), Some("hq-boosted"));
+        assert_eq!(series["tags"], json!([tag_id]));
+
+        // s01e06 and s01e07 are the next two, both already on disk but below
+        // cutoff, so they are monitored and searched individually.
+        assert!(fake.episode(16)["monitored"].as_bool().unwrap());
+        assert!(fake.episode(17)["monitored"].as_bool().unwrap());
+        assert_eq!(
+            fake.commands(),
+            vec![json!({"name": "EpisodeSearch", "episodeIds": [16, 17]})]
+        );
+        Ok(())
+    }
+
+    // Episodes already at the profile's cutoff produce no monitor call and no
+    // search command
+    #[tokio::test]
+    #[test_log::test]
+    async fn boost_nothing_to_upgrade() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(high_quality_episodes());
+        fake.add_quality_profile(make_quality_profile(9, "HQ-1080p", 1000));
+
+        actor_with_boost(&fake, 2, true, boost_rule(&["42"], "HQ-1080p", 2))
+            .prefetch(boosted_np())
+            .await?;
+
+        // The profile was still applied — that is what makes future upgrades
+        // possible — but nothing needed searching.
+        assert_eq!(fake.series_state(1234)["qualityProfileId"].as_i64(), Some(9));
+        assert!(fake.commands().is_empty());
+        assert!(!fake.episode(16)["monitored"].as_bool().unwrap());
+        Ok(())
+    }
+
+    // The episode being streamed is never monitored or searched — Sonarr
+    // replaces files in place and would kill the playback
+    #[tokio::test]
+    #[test_log::test]
+    async fn boost_never_touches_the_playing_episode() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(low_quality_episodes());
+        fake.add_quality_profile(make_quality_profile(9, "HQ-1080p", 1000));
+
+        actor_with_boost(&fake, 3, true, boost_rule(&["42"], "HQ-1080p", 3))
+            .prefetch(boosted_np())
+            .await?;
+
+        // s01e05 is playing
+        assert!(!fake.episode(15)["monitored"].as_bool().unwrap());
+        for command in fake.commands() {
+            let ids = command["episodeIds"].as_array().cloned().unwrap_or_default();
+            assert!(
+                !ids.contains(&json!(15)),
+                "the playing episode must not be searched: {command}"
+            );
+        }
+        Ok(())
+    }
+
+    // A boosted series is never season-searched, even with request_seasons on:
+    // a season pack upgrade would replace the file being streamed
+    #[tokio::test]
+    #[test_log::test]
+    async fn boost_forces_episode_searches() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        // Missing files, fully aired seasons — without a boost this is exactly
+        // the case that produces a SeasonSearch.
+        fake.add_episodes(default_episodes());
+        fake.add_quality_profile(make_quality_profile(9, "HQ-1080p", 0));
+
+        actor_with_boost(&fake, 2, true, boost_rule(&["42"], "HQ-1080p", 2))
+            .prefetch(boosted_np())
+            .await?;
+
+        for command in fake.commands() {
+            assert_eq!(
+                command["name"].as_str(),
+                Some("EpisodeSearch"),
+                "boosted series must not be season-searched: {command}"
+            );
+        }
+        Ok(())
+    }
+
+    // Episodes already in the download queue are not searched again
+    #[tokio::test]
+    #[test_log::test]
+    async fn boost_skips_queued_episodes() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(low_quality_episodes());
+        fake.add_quality_profile(make_quality_profile(9, "HQ-1080p", 1000));
+        fake.enqueue(1234, 16);
+
+        actor_with_boost(&fake, 2, true, boost_rule(&["42"], "HQ-1080p", 2))
+            .prefetch(boosted_np())
+            .await?;
+
+        assert_eq!(
+            fake.commands(),
+            vec![json!({"name": "EpisodeSearch", "episodeIds": [17]})]
+        );
+        Ok(())
+    }
+
+    // An existing tag is reused rather than duplicated, and other tags survive
+    #[tokio::test]
+    #[test_log::test]
+    async fn boost_reuses_existing_tag() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_tag(1, "hq-boosted");
+        let mut series = default_series();
+        series["tags"] = json!([7]);
+        fake.add_series(series);
+        fake.add_episodes(low_quality_episodes());
+        fake.add_quality_profile(make_quality_profile(9, "HQ-1080p", 1000));
+
+        actor_with_boost(&fake, 2, true, boost_rule(&["42"], "HQ-1080p", 2))
+            .prefetch(boosted_np())
+            .await?;
+
+        assert_eq!(fake.tags().len(), 1);
+        assert_eq!(fake.series_state(1234)["tags"], json!([7, 1]));
+        Ok(())
+    }
+
+    // A user without a matching rule keeps the unmodified behaviour: season
+    // searches, no profile change, no tag
+    #[tokio::test]
+    #[test_log::test]
+    async fn unboosted_user_unaffected() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(default_episodes());
+        fake.add_quality_profile(make_quality_profile(9, "HQ-1080p", 1000));
+
+        actor_with_boost(&fake, 2, true, boost_rule(&["42"], "HQ-1080p", 2))
+            .prefetch(NowPlaying {
+                series: Series::Title("TestShow".to_string()),
+                episode: 7,
+                season: 1,
+                ..np_default()
+            })
+            .await?;
+
+        let series = fake.series_state(1234);
+        assert_eq!(series["qualityProfileId"].as_i64(), Some(1));
+        assert!(series["tags"].is_null());
+        assert!(fake.tags().is_empty());
+        assert_eq!(
+            fake.commands(),
+            vec![
+                json!({"name": "SeasonSearch", "seriesId": 1234, "seasonNumber": 1}),
+                json!({"name": "SeasonSearch", "seriesId": 1234, "seasonNumber": 2}),
+            ]
+        );
+        Ok(())
+    }
+
+    // An unboosted viewer of an already-boosted series also gets episode
+    // searches: a season pack grabbed under the boosted profile would replace
+    // the file they are streaming
+    #[tokio::test]
+    #[test_log::test]
+    async fn already_boosted_series_skips_season_search() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fake = FakeSonarr::start().await;
+        fake.add_tag(1, "hq-boosted");
+        let mut series = default_series();
+        series["tags"] = json!([1]);
+        fake.add_series(series);
+        fake.add_episodes(default_episodes());
+        fake.add_quality_profile(make_quality_profile(9, "HQ-1080p", 1000));
+
+        // The viewer has no rule of their own; the series carries the tag from
+        // someone else's session.
+        actor_with_boost(&fake, 2, true, boost_rule(&["42"], "HQ-1080p", 2))
+            .prefetch(NowPlaying {
+                series: Series::Title("TestShow".to_string()),
+                episode: 5,
+                season: 1,
+                ..np_default()
+            })
+            .await?;
+
+        for command in fake.commands() {
+            assert_eq!(
+                command["name"].as_str(),
+                Some("EpisodeSearch"),
+                "boosted series must not be season-searched: {command}"
+            );
+        }
+        // The profile is left alone for a user without a rule
+        assert_eq!(fake.series_state(1234)["qualityProfileId"].as_i64(), Some(1));
+        Ok(())
+    }
+
+    // A missing episode inside the boost window is fetched once, not searched
+    // by both the fetch and the upgrade pass
+    #[tokio::test]
+    #[test_log::test]
+    async fn boost_does_not_double_search() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        // Not fully aired, so the fetch pass searches episodes rather than
+        // seasons and both passes cover the same ids.
+        let mut series = default_series();
+        series["seasons"][1] = make_season(1, false, false);
+        fake.add_series(series);
+        fake.add_episodes(default_episodes());
+        fake.add_quality_profile(make_quality_profile(9, "HQ-1080p", 1000));
+
+        actor_with_boost(&fake, 2, true, boost_rule(&["42"], "HQ-1080p", 2))
+            .prefetch(boosted_np())
+            .await?;
+
+        assert_eq!(
+            fake.commands(),
+            vec![json!({"name": "EpisodeSearch", "episodeIds": [16, 17]})]
+        );
+        Ok(())
+    }
+
+    // A series held by a second instance is found there
+    #[tokio::test]
+    #[test_log::test]
+    async fn routes_to_the_instance_holding_the_series()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty = FakeSonarr::start().await;
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(default_episodes());
+
+        actor_with_instances(vec![instance(&empty), instance(&fake)], 2, true)
+            .prefetch(NowPlaying {
+                series: Series::Title("TestShow".to_string()),
+                episode: 7,
+                season: 1,
+                ..np_default()
+            })
+            .await?;
+
+        assert!(empty.commands().is_empty());
+        assert!(!fake.commands().is_empty());
+        Ok(())
+    }
+
+    // The library decides which instance handles a session, even when both
+    // hold a series of that name
+    #[tokio::test]
+    #[test_log::test]
+    async fn routes_by_library() -> Result<(), Box<dyn std::error::Error>> {
+        let tv = FakeSonarr::start().await;
+        tv.add_series(default_series());
+        tv.add_episodes(default_episodes());
+
+        let anime = FakeSonarr::start().await;
+        anime.add_series(default_series());
+        anime.add_episodes(default_episodes());
+
+        let instances = vec![
+            instance_with(&tv, vec!["Television"], None, Vec::new()),
+            instance_with(&anime, vec!["Anime"], None, Vec::new()),
+        ];
+
+        actor_with_instances(instances, 2, true)
+            .prefetch(NowPlaying {
+                series: Series::Title("TestShow".to_string()),
+                episode: 7,
+                season: 1,
+                library: Some("Anime".to_string()),
+                ..np_default()
+            })
+            .await?;
+
+        assert!(tv.commands().is_empty());
+        assert!(!anime.commands().is_empty());
+        Ok(())
+    }
+
+    // With no library filters, the first instance holding the series wins
+    #[tokio::test]
+    #[test_log::test]
+    async fn first_matching_instance_wins() -> Result<(), Box<dyn std::error::Error>> {
+        let first = FakeSonarr::start().await;
+        first.add_series(default_series());
+        first.add_episodes(default_episodes());
+
+        let second = FakeSonarr::start().await;
+        second.add_series(default_series());
+        second.add_episodes(default_episodes());
+
+        actor_with_instances(vec![instance(&first), instance(&second)], 2, true)
+            .prefetch(NowPlaying {
+                series: Series::Title("TestShow".to_string()),
+                episode: 7,
+                season: 1,
+                ..np_default()
+            })
+            .await?;
+
+        assert!(!first.commands().is_empty());
+        assert!(second.commands().is_empty());
+        Ok(())
+    }
+
+    // Boost rules are per instance: the same user is boosted on one and not on
+    // the other
+    #[tokio::test]
+    #[test_log::test]
+    async fn boost_rules_are_per_instance() -> Result<(), Box<dyn std::error::Error>> {
+        let tv = FakeSonarr::start().await;
+        tv.add_series(default_series());
+        tv.add_episodes(low_quality_episodes());
+
+        let anime = FakeSonarr::start().await;
+        anime.add_series(default_series());
+        anime.add_episodes(low_quality_episodes());
+        anime.add_quality_profile(make_quality_profile(9, "HQ-Anime", 1000));
+
+        let instances = vec![
+            instance_with(&tv, vec!["Television"], None, Vec::new()),
+            instance_with(
+                &anime,
+                vec!["Anime"],
+                None,
+                vec![boost_rule(&["42"], "HQ-Anime", 2)],
+            ),
+        ];
+
+        actor_with_instances(instances, 2, true)
+            .prefetch(NowPlaying {
+                library: Some("Anime".to_string()),
+                ..boosted_np()
+            })
+            .await?;
+
+        assert_eq!(anime.series_state(1234)["qualityProfileId"].as_i64(), Some(9));
+        assert_eq!(tv.series_state(1234)["qualityProfileId"].as_i64(), Some(1));
+        assert!(tv.commands().is_empty());
+        Ok(())
+    }
+
+    // A quality profile that does not exist in Sonarr fails the boost loudly
+    // instead of silently prefetching at the old quality
+    #[tokio::test]
+    #[test_log::test]
+    async fn boost_unknown_quality_profile_errors() {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(low_quality_episodes());
+
+        let result = actor_with_boost(&fake, 2, true, boost_rule(&["42"], "Nonexistent", 2))
+            .prefetch(boosted_np())
+            .await;
+
+        assert!(result.is_err());
+        assert!(fake.commands().is_empty());
+    }
+
+    // A dry run reaches the end of the boost path without writing anything to
+    // Sonarr
+    #[tokio::test]
+    #[test_log::test]
+    async fn dry_run_makes_no_writes() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(low_quality_episodes());
+        fake.add_quality_profile(make_quality_profile(9, "HQ-1080p", 1000));
+
+        let instance = super::Instance::new(
+            "test".to_string(),
+            crate::sonarr::Client::new(fake.url(), "secret", true).unwrap(),
+            Vec::new(),
+            None,
+            vec![boost_rule(&["42"], "HQ-1080p", 2)],
+        );
+
+        actor_with_instances(vec![instance], 2, true)
+            .prefetch(boosted_np())
+            .await?;
+
+        let series = fake.series_state(1234);
+        assert_eq!(series["qualityProfileId"].as_i64(), Some(1));
+        assert!(series["tags"].is_null());
+        assert!(fake.tags().is_empty());
+        assert!(fake.commands().is_empty());
+        assert!(!fake.episode(16)["monitored"].as_bool().unwrap());
+        Ok(())
+    }
+
+    // Re-triggering the same episode for the same user is a no-op
+    #[tokio::test]
+    #[test_log::test]
+    async fn boost_deduplicates() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(low_quality_episodes());
+        fake.add_quality_profile(make_quality_profile(9, "HQ-1080p", 1000));
+
+        let mut actor = actor_with_boost(&fake, 2, true, boost_rule(&["42"], "HQ-1080p", 2));
+        actor.prefetch(boosted_np()).await?;
+        actor.prefetch(boosted_np()).await?;
+
+        assert_eq!(fake.commands().len(), 1);
         Ok(())
     }
 }

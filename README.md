@@ -42,6 +42,7 @@ services:
         append_to_queue = false  # Experimental: Append upcoming episodes to the player's active queue.
                                  # Not supported by all clients. Not compatible with Tautulli.
         connection_retries = 6   # Number of retries for the initial connection probing
+        dry_run = false          # Optional: Log every change to Sonarr instead of applying it
 
         [media_server]
         type = "Jellyfin"                       # `Jellyfin`, `Emby`, `Plex` or `Tautulli`
@@ -50,10 +51,28 @@ services:
         # users = [ "John", "12345", "Axel F" ] # Optional: Only monitor sessions for specific user IDs or names
         # libraries = [ "TV Shows", "Anime" ]   # Optional: Only monitor sessions for specific libraries
 
-        [sonarr]
+        [[sonarr]]
+        # name = "tv"                     # Optional: Name used to tell instances apart in the logs
         url = "http://example.com/sonarr" # Sonarr baseurl
         api_key = "<YOUR KEY HERE>"       # Sonarr API key
         # exclude_tag = "no_prefetch"     # Optional: Exclude series by tag
+        # libraries = [ "TV Shows" ]      # Optional: Only handle sessions from these libraries
+
+        # Optional: Upgrade the quality of upcoming episodes for specific users.
+        # See "Per-user quality boost" below.
+        #   [[sonarr.boost]]
+        #   users = [ "John", "12345" ]      # User IDs or names this rule applies to
+        #   quality_profile = "HQ-1080p"     # Sonarr quality profile to switch the series to
+        #   prefetch_num = 5                 # Optional: Episodes to upgrade in advance
+        #   tag = "prefetcharr-boosted"      # Optional: Tag applied to boosted series
+        #   search_cooldown = 43200          # Optional: Don't search an episode again within this many seconds
+
+        # Optional: Further Sonarr instances, e.g. a dedicated anime one.
+        # [[sonarr]]
+        # name = "anime"
+        # url = "http://example.com/sonarr-anime"
+        # api_key = "<YOUR KEY HERE>"
+        # libraries = [ "Anime" ]
 
     volumes:
       - /path/to/log/dir:/log
@@ -103,6 +122,59 @@ use it as the API key.
 Log in and go to `Settings` -> `Web Interface` -> API. Copy the key and make
 sure `Enable API` is ticked.
 
+
+### Multiple Sonarr instances
+
+Configure one `[[sonarr]]` table per instance. When a session starts,
+_prefetcharr_ looks for the series on every instance that serves the session's
+library and uses the first one that has it.
+
+Give an instance a `libraries` list to route sessions explicitly — for example a
+`TV Shows` library to your main Sonarr and an `Anime` library to a dedicated
+one. An instance without `libraries` accepts sessions from any library. Note
+that `media_server.libraries`, if set, still filters sessions before routing, so
+every library you want handled has to be listed there too.
+
+A single `[sonarr]` table remains valid and behaves exactly as before.
+
+### Per-user quality boost
+
+By default _prefetcharr_ only fetches episodes that are missing entirely. A
+`[[sonarr.boost]]` rule extends that for the users it names: when one of them
+starts watching, the series is switched to the configured quality profile,
+tagged, and the next `prefetch_num` episodes are searched individually —
+including episodes that are already on disk, so they get *upgraded* rather than
+just fetched. Everyone else keeps the default behaviour.
+
+Points worth knowing before enabling it:
+
+- **The profile must allow upgrades.** In _Sonarr_, the quality profile needs
+  `Upgrades Allowed` ticked and a cutoff above what your library normally holds.
+  Otherwise Sonarr decides existing files are already good enough and nothing
+  happens. _prefetcharr_ logs a warning if the profile has upgrades disabled.
+- **Custom format score is a separate cutoff.** `Upgrade Until Custom Format
+  Score` is independent of the quality cutoff, so an episode can be
+  quality-cutoff-met and still far below the target. With a
+  [TRaSH][custom-format]/Recyclarr profile this is usually what actually drives
+  the upgrades.
+- **Reverting is manual.** Boosted series are tagged (`prefetcharr-boosted` by
+  default, created in Sonarr if missing). To undo a boost, filter by that tag in
+  Sonarr's series editor and change the profile back in bulk. _prefetcharr_
+  never reverts a profile on its own.
+- **The profile applies to the whole series, for everyone.** Sonarr quality
+  profiles are per series, so a boost also affects other users watching it, and
+  Sonarr will upgrade the rest of that series on its own schedule.
+- **Boosted series are never season-searched.** Sonarr replaces files in place
+  when upgrading, and a season pack covers the episode currently being streamed.
+  Once a series carries the boost tag, _prefetcharr_ searches individual
+  episodes for it even with `request_seasons = true`.
+- **Mind your indexer budget.** Each playback event costs up to `prefetch_num`
+  searches. Episodes that are already at the target quality, already in the
+  download queue, not yet aired, or searched within `search_cooldown` are
+  skipped, which keeps repeat triggers cheap.
+
+Set `dry_run = true` to see exactly what a rule would do — every change to
+Sonarr is logged and none is applied.
 
 ### Upgrading pilots
 
