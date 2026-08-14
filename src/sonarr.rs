@@ -394,7 +394,14 @@ impl Client {
 
     pub async fn search_episodes(&self, episodes: &[EpisodeResource]) -> Result<serde_json::Value> {
         let episode_ids: Vec<_> = episodes.iter().map(|e| e.id).collect();
-        info!(?episode_ids, "Searching episodes");
+        // Log which episodes these are, not just their Sonarr IDs. The IDs are
+        // opaque, and the one thing worth being able to check at a glance is
+        // that the episode being streamed is not among them.
+        let episodes_searched: Vec<String> = episodes
+            .iter()
+            .map(|e| format!("s{:02}e{:02}", e.season_number, e.episode_number))
+            .collect();
+        info!(?episode_ids, ?episodes_searched, "Searching episodes");
         let cmd = json!({
             "name": "EpisodeSearch",
             "episodeIds": episode_ids,
