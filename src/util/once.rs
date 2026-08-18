@@ -20,6 +20,12 @@ impl<K: Eq + Hash> Seen<K> {
         self.0.insert(key, Instant::now()).is_none()
     }
 
+    // Drop a key so the next `once` call accepts it again. Used to re-arm a
+    // prefetch that was abandoned with episodes still missing.
+    pub fn forget(&mut self, key: &K) {
+        self.0.remove(key);
+    }
+
     fn prune(&mut self) {
         self.0
             .retain(|_, t| Instant::now().saturating_duration_since(*t) <= RETAIN_DURATION);

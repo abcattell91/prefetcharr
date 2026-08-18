@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,10 +13,14 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     Message, boost,
-    media_server::{EpisodeRef, NowPlaying, PrefetchKey, Queue, Series},
+    media_server::{EpisodeRef, NowPlaying, PrefetchKey, Queue, Series, WatchKey},
     sonarr,
     util::{once::Seen, time},
 };
+
+// Warn once an episode has been searched this many times without landing, so a
+// genuinely unobtainable release is visible in the log instead of looping quietly.
+const RETRY_WARN_AFTER: u32 = 3;
 
 struct Pending {
     series: Series,
@@ -104,6 +108,22 @@ impl Default for Fetched {
     }
 }
 
+// Episodes a prefetch searched for that had no file at the time, tracked for as
+// long as the series is still being watched. Whether one is due for another
+// search is judged from Sonarr's own `lastSearchTime`, not a local timer, so the
+// pacing survives a restart.
+struct Watch {
+    unfulfilled: BTreeMap<EpisodeRef, Attempt>,
+    // The `Seen` keys whose prefetch produced these episodes, so they can be
+    // un-marked if this entry expires with work still outstanding.
+    sources: HashSet<PrefetchKey>,
+    last_seen: Instant,
+}
+
+struct Attempt {
+    count: u32,
+}
+
 pub struct Actor {
     rx: mpsc::Receiver<Message>,
     instances: Vec<Instance>,
@@ -114,6 +134,10 @@ pub struct Actor {
     pending: HashMap<String, Pending>,
     has_pending: Arc<AtomicBool>,
     pending_ttl: Duration,
+    watching: HashMap<WatchKey, Watch>,
+    // `None` disables retrying; `Some(d)` is the minimum delay between two
+    // searches for the same episode.
+    retry: Option<Duration>,
 }
 
 impl Actor {
@@ -127,6 +151,7 @@ impl Actor {
         queue: Option<Arc<dyn Queue + Send + Sync>>,
         has_pending: Arc<AtomicBool>,
         pending_ttl: Duration,
+        retry: Option<Duration>,
     ) -> Self {
         Self {
             rx,
@@ -138,6 +163,8 @@ impl Actor {
             pending: HashMap::new(),
             has_pending,
             pending_ttl,
+            watching: HashMap::new(),
+            retry,
         }
     }
 }
@@ -159,7 +186,7 @@ impl Actor {
                     }
                 }
                 _ = gc.tick() => {
-                    self.gc_pending();
+                    self.gc();
                     self.publish_has_pending();
                 }
             }
@@ -168,28 +195,42 @@ impl Actor {
 
     pub async fn prefetch(&mut self, np: NowPlaying) -> anyhow::Result<()> {
         self.refresh_pending(&np);
+        self.touch_watch(&np);
 
         let result = self.run_prefetch(&np).await;
 
         if let Ok(Some(pairs)) = &result
-            && let Some(sid) = np.session_id.clone()
             && !pairs.is_empty()
         {
-            let entry = self.pending.entry(sid).or_insert_with(|| Pending {
-                series: np.series.clone(),
-                owed: BTreeSet::new(),
-                last_seen: Instant::now(),
-            });
-            entry.owed.extend(pairs.iter().copied());
+            if self.queue.is_some()
+                && let Some(sid) = np.session_id.clone()
+            {
+                let entry = self.pending.entry(sid).or_insert_with(|| Pending {
+                    series: np.series.clone(),
+                    owed: BTreeSet::new(),
+                    last_seen: Instant::now(),
+                });
+                entry.owed.extend(pairs.iter().copied());
+            }
+            self.record_unfulfilled(&np, pairs);
         }
+
+        // The retry pass deliberately runs outside the `Seen` gate, so a repeat
+        // poll of the same episode still verifies what the first pass searched.
+        let just_searched: &[EpisodeRef] = match &result {
+            Ok(Some(pairs)) => pairs,
+            _ => &[],
+        };
+        let just_searched = just_searched.to_vec();
+        let retried = self.retry_unfulfilled(&np, &just_searched).await;
 
         // Always run flush + GC, even if Sonarr work failed — pending state
         // is independent of Sonarr success.
         self.flush_queue(&np).await;
-        self.gc_pending();
+        self.gc();
         self.publish_has_pending();
 
-        result.map(|_| ())
+        result.map(|_| ()).and(retried)
     }
 
     async fn run_prefetch(&mut self, np: &NowPlaying) -> anyhow::Result<Option<Vec<EpisodeRef>>> {
@@ -505,11 +546,171 @@ impl Actor {
         }
     }
 
-    fn gc_pending(&mut self) {
+    fn touch_watch(&mut self, np: &NowPlaying) {
+        if let Some(watch) = self.watching.get_mut(&WatchKey::from(np)) {
+            watch.last_seen = Instant::now();
+        }
+    }
+
+    fn record_unfulfilled(&mut self, np: &NowPlaying, refs: &[EpisodeRef]) {
+        if self.retry.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let watch = self
+            .watching
+            .entry(WatchKey::from(np))
+            .or_insert_with(|| Watch {
+                unfulfilled: BTreeMap::new(),
+                sources: HashSet::new(),
+                last_seen: now,
+            });
+        watch.last_seen = now;
+        watch.sources.insert(PrefetchKey::from(np));
+        for r in refs {
+            watch.unfulfilled.entry(*r).or_insert(Attempt { count: 1 });
+        }
+    }
+
+    // Re-check the episodes an earlier prefetch searched for and search again for
+    // the ones that still have no file. Runs on every poll, independently of the
+    // `Seen` gate that stops `run_prefetch` from repeating.
+    /// Re-check the episodes an earlier prefetch searched for and search again
+    /// for those that still have no file. Runs on every poll, independently of
+    /// the `Seen` gate that stops `run_prefetch` from repeating.
+    ///
+    /// Only ever searches individual episodes, never seasons: a season pack
+    /// would cover the episode being streamed right now.
+    ///
+    /// `just_searched` are the episodes the fetch pass handled moments ago in
+    /// this same poll. They must be excluded: Sonarr queues a search command
+    /// asynchronously, so `lastSearchTime` is still unset when we re-read the
+    /// episode, and the cooldown alone would let an immediate duplicate through.
+    async fn retry_unfulfilled(
+        &mut self,
+        np: &NowPlaying,
+        just_searched: &[EpisodeRef],
+    ) -> anyhow::Result<()> {
+        let Some(retry_interval) = self.retry else {
+            return Ok(());
+        };
+        let key = WatchKey::from(np);
+        let tracked: HashSet<EpisodeRef> = match self.watching.get(&key) {
+            Some(w) if !w.unfulfilled.is_empty() => w.unfulfilled.keys().copied().collect(),
+            _ => return Ok(()),
+        };
+
+        let (index, series) = self.find_series(np).await?;
+        let client = self.instances[index].client.clone();
+        let episodes = client.episodes_matching(&series, &tracked).await?;
+
+        let known: HashSet<EpisodeRef> = episodes
+            .iter()
+            .map(|e| EpisodeRef::new(e.season_number, e.episode_number))
+            .collect();
+        let landed: HashSet<EpisodeRef> = episodes
+            .iter()
+            .filter(|e| e.has_file)
+            .map(|e| EpisodeRef::new(e.season_number, e.episode_number))
+            .collect();
+
+        let Some(watch) = self.watching.get_mut(&key) else {
+            return Ok(());
+        };
+        for r in &landed {
+            info!(episode = %r, "prefetched episode is now available");
+        }
+        // Drop what landed, plus anything Sonarr no longer lists — an episode it
+        // does not know about can never land.
+        watch
+            .unfulfilled
+            .retain(|r, _| known.contains(r) && !landed.contains(r));
+
+        if watch.unfulfilled.is_empty() {
+            self.watching.remove(&key);
+            return Ok(());
+        }
+
+        // Pacing comes from Sonarr's own `lastSearchTime` rather than a local
+        // timer, so it survives a restart and accounts for searches this process
+        // never issued.
+        let now = time::now().and_then(|n| i64::try_from(n).ok()).unwrap_or(0);
+        let cooldown = i64::try_from(retry_interval.as_secs()).unwrap_or(i64::MAX);
+        let still_missing: HashSet<EpisodeRef> = watch.unfulfilled.keys().copied().collect();
+
+        // An episode already in Sonarr's download queue is on its way; searching
+        // again would only fight the download in progress.
+        let queued = client
+            .queued_episode_ids(series.id)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("cannot read the download queue, retrying anyway: {e:#}");
+                HashSet::new()
+            });
+
+        let candidates = select_retries(
+            episodes,
+            &still_missing,
+            just_searched,
+            &queued,
+            now,
+            cooldown,
+        );
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        let refs: Vec<EpisodeRef> = candidates
+            .iter()
+            .map(|e| EpisodeRef::new(e.season_number, e.episode_number))
+            .collect();
+        info!(
+            episodes = ?refs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "prefetched episodes still missing, searching again"
+        );
+        client.update_episode_monitoring(&candidates).await?;
+        client.search_episodes(&candidates).await?;
+
+        if let Some(watch) = self.watching.get_mut(&key) {
+            for r in &refs {
+                if let Some(attempt) = watch.unfulfilled.get_mut(r) {
+                    attempt.count += 1;
+                    if attempt.count >= RETRY_WARN_AFTER {
+                        warn!(
+                            episode = %r,
+                            attempts = attempt.count,
+                            "episode still unavailable after repeated searches"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn gc(&mut self) {
         let now = Instant::now();
         let ttl = self.pending_ttl;
         self.pending
             .retain(|_, p| now.saturating_duration_since(p.last_seen) <= ttl);
+
+        // A watch expiring with episodes still missing means the prefetch never
+        // completed. Un-mark its `Seen` keys so replaying that episode another day
+        // runs a fresh prefetch instead of being skipped as already handled.
+        let seen = &mut self.seen;
+        self.watching.retain(|_, w| {
+            if now.saturating_duration_since(w.last_seen) <= ttl {
+                return true;
+            }
+            if !w.unfulfilled.is_empty() {
+                for key in &w.sources {
+                    debug!(?key, "re-arming prefetch abandoned with episodes missing");
+                    seen.forget(key);
+                }
+            }
+            false
+        });
     }
 
     fn publish_has_pending(&self) {
@@ -586,6 +787,49 @@ impl Actor {
             )
         })
     }
+}
+
+/// Pick the episodes of a tracked window that are worth searching for again.
+///
+/// Kept out of `retry_unfulfilled` so the filtering rules read as a list rather
+/// than as one long method, mirroring `boost::select_upgrades`.
+fn select_retries(
+    episodes: Vec<sonarr::EpisodeResource>,
+    still_missing: &HashSet<EpisodeRef>,
+    just_searched: &[EpisodeRef],
+    queued: &HashSet<i32>,
+    now: i64,
+    cooldown: i64,
+) -> Vec<sonarr::EpisodeResource> {
+    episodes
+        .into_iter()
+        .filter(|e| still_missing.contains(&EpisodeRef::new(e.season_number, e.episode_number)))
+        .filter(|e| !just_searched.contains(&EpisodeRef::new(e.season_number, e.episode_number)))
+        .filter(|e| {
+            let downloading = queued.contains(&e.id);
+            if downloading {
+                debug!(id = e.id, "episode is downloading, not searching again");
+            }
+            !downloading
+        })
+        .filter(|e| {
+            let recent = e
+                .last_search_time
+                .as_deref()
+                .and_then(time::parse_utc_timestamp)
+                .is_some_and(|last| now.saturating_sub(last) < cooldown);
+            if recent {
+                debug!(id = e.id, "searched recently, skipping");
+            }
+            !recent
+        })
+        .map(|mut e| {
+            // A search only grabs for a monitored episode, and plenty of
+            // upcoming episodes are not.
+            e.monitored = true;
+            e
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -692,6 +936,7 @@ mod test {
             None,
             Arc::new(AtomicBool::new(false)),
             Duration::from_secs(3600),
+            None,
         )
     }
 
@@ -712,6 +957,7 @@ mod test {
             Some(queue as Arc<dyn Queue + Send + Sync>),
             has_pending,
             pending_ttl,
+            None,
         )
     }
 
@@ -761,6 +1007,20 @@ mod test {
     ) -> super::Actor {
         let instance = instance_with(fake, Vec::new(), None, vec![rule]);
         actor_with_instances(vec![instance], prefetch_num, request_seasons)
+    }
+
+    /// An actor with retrying enabled. `retry_interval` is kept tiny so tests
+    /// can step past it with a real sleep instead of mocking the clock.
+    fn actor_with_retry(
+        fake: &FakeSonarr,
+        prefetch_num: usize,
+        retry_interval: Duration,
+        ttl: Duration,
+    ) -> super::Actor {
+        let mut actor = actor_with_instances(vec![instance(fake)], prefetch_num, false);
+        actor.retry = Some(retry_interval);
+        actor.pending_ttl = ttl;
+        actor
     }
 
     // Prefetching from mid-season triggers season searches for the current and next season
@@ -1351,6 +1611,225 @@ mod test {
             .ok();
 
         assert!(!has_pending.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    fn missing_np() -> NowPlaying {
+        NowPlaying {
+            series: Series::Title("TestShow".to_string()),
+            episode: 7,
+            season: 1,
+            ..np_default()
+        }
+    }
+
+    // An episode that was searched but never landed is searched again once the
+    // retry interval has elapsed — even though `Seen` blocks the first pass.
+    #[tokio::test]
+    #[test_log::test]
+    async fn retry_searches_again_when_still_missing() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(default_episodes());
+
+        let mut actor = actor_with_retry(&fake, 1, Duration::ZERO, Duration::from_secs(3600));
+        actor.prefetch(missing_np()).await?;
+        assert_eq!(
+            fake.commands(),
+            vec![json!({"name": "EpisodeSearch", "episodeIds": [18]})]
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        actor.prefetch(missing_np()).await?;
+
+        assert_eq!(
+            fake.commands(),
+            vec![
+                json!({"name": "EpisodeSearch", "episodeIds": [18]}),
+                json!({"name": "EpisodeSearch", "episodeIds": [18]}),
+            ]
+        );
+        Ok(())
+    }
+
+    // Once Sonarr has the file, the episode stops being retried.
+    #[tokio::test]
+    #[test_log::test]
+    async fn retry_stops_when_episode_lands() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(default_episodes());
+
+        let mut actor = actor_with_retry(&fake, 1, Duration::ZERO, Duration::from_secs(3600));
+        actor.prefetch(missing_np()).await?;
+        fake.clear_commands();
+        fake.set_has_file(18, true);
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        actor.prefetch(missing_np()).await?;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        actor.prefetch(missing_np()).await?;
+
+        assert!(fake.commands().is_empty());
+        Ok(())
+    }
+
+    // Retries are paced by `retry_interval`; a poll before it elapses is a no-op.
+    #[tokio::test]
+    #[test_log::test]
+    async fn retry_respects_interval() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(default_episodes());
+
+        let mut actor = actor_with_retry(
+            &fake,
+            1,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        actor.prefetch(missing_np()).await?;
+        fake.clear_commands();
+
+        actor.prefetch(missing_np()).await?;
+
+        assert!(fake.commands().is_empty());
+        Ok(())
+    }
+
+    // An episode already downloading is left alone until it leaves the queue.
+    #[tokio::test]
+    #[test_log::test]
+    async fn retry_skips_queued_episodes() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(default_episodes());
+
+        let mut actor = actor_with_retry(&fake, 1, Duration::ZERO, Duration::from_secs(3600));
+        actor.prefetch(missing_np()).await?;
+        fake.clear_commands();
+        fake.enqueue(1234, 18);
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        actor.prefetch(missing_np()).await?;
+        assert!(fake.commands().is_empty());
+
+        // Download fell out of the queue without producing a file → retry resumes.
+        fake.clear_queue();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        actor.prefetch(missing_np()).await?;
+        assert_eq!(
+            fake.commands(),
+            vec![json!({"name": "EpisodeSearch", "episodeIds": [18]})]
+        );
+        Ok(())
+    }
+
+    // With retrying disabled the actor behaves exactly as before: one search.
+    #[tokio::test]
+    #[test_log::test]
+    async fn retry_disabled_is_noop() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(default_episodes());
+
+        let mut actor = actor(&fake, 1, false);
+        actor.prefetch(missing_np()).await?;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        actor.prefetch(missing_np()).await?;
+
+        assert_eq!(
+            fake.commands(),
+            vec![json!({"name": "EpisodeSearch", "episodeIds": [18]})]
+        );
+        Ok(())
+    }
+
+    // A watch that expires with episodes still missing re-arms the prefetch, so
+    // playing that same episode another day searches again instead of being
+    // skipped as already processed.
+    #[tokio::test]
+    #[test_log::test]
+    async fn expired_watch_rearms_prefetch() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(default_episodes());
+
+        let mut actor = actor_with_retry(
+            &fake,
+            1,
+            Duration::from_secs(3600),
+            Duration::from_millis(50),
+        );
+        actor.prefetch(missing_np()).await?;
+        fake.clear_commands();
+
+        // Playback stops; the watch ages out past the TTL.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        actor.gc();
+
+        actor.prefetch(missing_np()).await?;
+
+        assert_eq!(
+            fake.commands(),
+            vec![json!({"name": "EpisodeSearch", "episodeIds": [18]})]
+        );
+        Ok(())
+    }
+
+    // A prefetch whose episodes all landed keeps its `Seen` mark — replaying the
+    // episode must not search again.
+    #[tokio::test]
+    #[test_log::test]
+    async fn fulfilled_watch_stays_seen() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(default_episodes());
+
+        let mut actor = actor_with_retry(
+            &fake,
+            1,
+            Duration::from_secs(3600),
+            Duration::from_millis(50),
+        );
+        actor.prefetch(missing_np()).await?;
+        fake.clear_commands();
+
+        // The episode arrives, so the next poll clears the watch entry.
+        fake.set_has_file(18, true);
+        actor.prefetch(missing_np()).await?;
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        actor.gc();
+        actor.prefetch(missing_np()).await?;
+
+        assert!(fake.commands().is_empty());
+        Ok(())
+    }
+
+    // Outstanding retries must not flip `has_pending` — that flag drives the 60s
+    // fast poll and belongs to the queue-append feature alone.
+    #[tokio::test]
+    #[test_log::test]
+    async fn retry_does_not_set_has_pending() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        fake.add_episodes(default_episodes());
+
+        let mut actor = actor_with_retry(&fake, 1, Duration::ZERO, Duration::from_secs(3600));
+        actor
+            .prefetch(NowPlaying {
+                session_id: Some("s1".into()),
+                ..missing_np()
+            })
+            .await?;
+
+        assert!(
+            !actor.watching.is_empty(),
+            "retry should be tracking s01e08"
+        );
+        assert!(actor.pending.is_empty(), "no queue configured");
+        assert!(!actor.has_pending.load(Ordering::Relaxed));
         Ok(())
     }
 

@@ -95,6 +95,26 @@ impl FakeSonarr {
         self.state.lock().unwrap().tags.clone()
     }
 
+    // Simulate Sonarr importing (or losing) a file for an episode.
+    pub fn set_has_file(&self, id: i32, has_file: bool) {
+        let mut state = self.state.lock().unwrap();
+        for ep in &mut state.episodes {
+            if ep["id"].as_i64() == Some(i64::from(id)) {
+                ep["hasFile"] = Value::Bool(has_file);
+            }
+        }
+    }
+
+    /// Drop everything from the download queue, as if the grabs had finished
+    /// or failed.
+    pub fn clear_queue(&self) {
+        self.state.lock().unwrap().queue.clear();
+    }
+
+    pub fn clear_commands(&self) {
+        self.state.lock().unwrap().commands.clear();
+    }
+
     pub fn commands(&self) -> Vec<Value> {
         self.state.lock().unwrap().commands.clone()
     }
@@ -406,6 +426,65 @@ async fn post_command(
         );
     }
 
+    let now = utc_timestamp();
+    match body["name"].as_str() {
+        Some("EpisodeSearch") => {
+            let ids: Vec<i64> = body["episodeIds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_i64)
+                .collect();
+            for ep in &mut state.episodes {
+                if ids.contains(&ep["id"].as_i64().unwrap_or(-1)) {
+                    ep["lastSearchTime"] = Value::String(now.clone());
+                }
+            }
+        }
+        Some("SeasonSearch") => {
+            let series_id = body["seriesId"].as_i64();
+            let season = body["seasonNumber"].as_i64();
+            for ep in &mut state.episodes {
+                if ep["seriesId"].as_i64() == series_id && ep["seasonNumber"].as_i64() == season {
+                    ep["lastSearchTime"] = Value::String(now.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+
     state.commands.push(body);
     Json(json!({}))
+}
+
+/// Current time as Sonarr serializes it (`YYYY-MM-DDTHH:MM:SSZ`).
+///
+/// Lives here rather than in `util::time` because only the fake ever needs to
+/// go from epoch seconds back to a string.
+fn utc_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .cast_signed();
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+
+    // Howard Hinnant's civil_from_days, the inverse of the parser's
+    // days_from_civil.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }

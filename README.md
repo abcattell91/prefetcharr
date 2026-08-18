@@ -14,6 +14,13 @@ tries to fetch all seasons that contain them.
 If there are no more seasons left, the series is monitored for new seasons
 instead.
 
+A search does not guarantee an episode actually turns up — a release may be
+unobtainable, or the download may fail.  
+While you keep watching a series, _prefetcharr_ therefore re-checks whether the
+episodes it searched for have a file yet, and searches again for those that do
+not.  
+Episodes _Sonarr_ is currently downloading are left alone.
+
 ## Build and install
 
 To install, first ensure Rust is installed on your system by following the
@@ -41,6 +48,8 @@ services:
         request_seasons = true   # Always request full seasons to prefer season packs
         append_to_queue = false  # Experimental: Append upcoming episodes to the player's active queue.
                                  # Not supported by all clients. Not compatible with Tautulli.
+        retry_unavailable = true # Search again for prefetched episodes that never turned up
+        retry_interval = 1800    # Minimum seconds between two searches for the same episode
         connection_retries = 6   # Number of retries for the initial connection probing
         dry_run = false          # Optional: Log every change to Sonarr instead of applying it
 
@@ -175,6 +184,20 @@ Points worth knowing before enabling it:
 
 Set `dry_run = true` to see exactly what a rule would do — every change to
 Sonarr is logged and none is applied.
+
+### Retrying unavailable episodes
+
+`retry_unavailable` re-searches episodes that were requested but never turned
+up. Retries happen only while the series is still being watched, and at most
+once per `retry_interval` per episode, so indexers are not hammered on behalf of
+a release that does not exist.
+
+If you stop watching while episodes are still missing, _prefetcharr_ forgets
+that it handled that episode, so playing it again another day starts a fresh
+prefetch rather than being skipped as already done.
+
+Set `retry_unavailable = false` to keep the original behaviour of searching
+exactly once and leaving everything else to _Sonarr_.
 
 ### Upgrading pilots
 
