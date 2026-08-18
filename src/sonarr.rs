@@ -321,7 +321,7 @@ impl Client {
         Ok(())
     }
 
-    async fn episodes(
+    pub async fn episodes(
         &self,
         series: &SeriesResource,
         include_episode_file: bool,

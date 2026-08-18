@@ -227,6 +227,13 @@ async fn run(config: Config) -> anyhow::Result<()> {
         );
     }
 
+    let sweep = config
+        .sweep_seasons
+        .then(|| Duration::from_secs(config.sweep_cooldown));
+    if sweep.is_some() {
+        info!("Sweeping seasons other than the one being watched");
+    }
+
     let seen = Seen::default();
     let mut actor = process::Actor::new(
         rx,
@@ -238,7 +245,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
         has_pending,
         pending_ttl,
         retry,
-    );
+    )
+    .with_sweep(sweep);
 
     let _ = tokio::join!(np_updates, actor.process(), client.run());
 

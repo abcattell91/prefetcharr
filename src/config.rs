@@ -161,12 +161,23 @@ pub struct Config {
     /// Minimum seconds between two searches for the same episode
     #[serde(default = "default_retry_interval")]
     pub retry_interval: u64,
+    /// Also search whole seasons other than the one being watched, to backfill
+    /// the rest of the series in bulk
+    #[serde(default)]
+    pub sweep_seasons: bool,
+    /// Don't sweep the same season again within this many seconds
+    #[serde(default = "default_sweep_cooldown")]
+    pub sweep_cooldown: u64,
     #[serde(default)]
     pub legacy: bool,
 }
 
 fn default_retry_unavailable() -> bool {
     true
+}
+
+fn default_sweep_cooldown() -> u64 {
+    60 * 60 * 24
 }
 
 fn default_retry_interval() -> u64 {
@@ -217,6 +228,8 @@ impl From<LegacyArgs> for Config {
             dry_run: false,
             retry_unavailable: default_retry_unavailable(),
             retry_interval: default_retry_interval(),
+            sweep_seasons: false,
+            sweep_cooldown: default_sweep_cooldown(),
             legacy: true,
         }
     }

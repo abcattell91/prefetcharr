@@ -50,6 +50,9 @@ services:
                                  # Not supported by all clients. Not compatible with Tautulli.
         retry_unavailable = true # Search again for prefetched episodes that never turned up
         retry_interval = 1800    # Minimum seconds between two searches for the same episode
+        sweep_seasons = false    # Also bulk-search seasons other than the one being watched.
+                                 # Downloads the whole series over time — see below.
+        sweep_cooldown = 86400   # Minimum seconds before sweeping the same season again
         connection_retries = 6   # Number of retries for the initial connection probing
         dry_run = false          # Optional: Log every change to Sonarr instead of applying it
 
@@ -198,6 +201,29 @@ prefetch rather than being skipped as already done.
 
 Set `retry_unavailable = false` to keep the original behaviour of searching
 exactly once and leaving everything else to _Sonarr_.
+
+### Sweeping other seasons
+
+By default _prefetcharr_ only searches the next few episodes, one search per
+episode. On a long show that is a lot of indexer requests for what a single
+season search would cover.
+
+`sweep_seasons = true` adds a bulk pass: after the targeted search for the
+episodes you are about to watch, whole seasons *other than the one you are
+watching* are searched in one request each.
+
+- **The season being watched is never swept.** Sonarr replaces files in place
+  when upgrading, and a season pack covers the episode playing right now — a
+  pack for the current season could swap the file out mid-playback. This is the
+  same reason boosted series are never season-searched.
+- **Seasons already covered by the prefetch window are skipped**, so the sweep
+  does not compete with the search for episodes you are about to watch.
+- **Only fully aired seasons with something missing are swept**, and each at
+  most once per `sweep_cooldown`, judged from Sonarr's own `lastSearchTime`.
+- **This downloads the whole series over time.** That is the opposite of
+  fetching on demand, so it is off by default. On a boosted series a season
+  pack will also replace existing files in that season as an upgrade. Mind your
+  disk and your bandwidth.
 
 ### Upgrading pilots
 

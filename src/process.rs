@@ -95,6 +95,8 @@ struct Fetched {
     missing: Vec<EpisodeRef>,
     /// Episode IDs already handed to an `EpisodeSearch`
     searched_ids: HashSet<i32>,
+    /// Seasons the prefetch window reached, which the sweep must leave alone
+    window_seasons: HashSet<i32>,
     result: anyhow::Result<()>,
 }
 
@@ -103,6 +105,7 @@ impl Default for Fetched {
         Self {
             missing: Vec::new(),
             searched_ids: HashSet::new(),
+            window_seasons: HashSet::new(),
             result: Ok(()),
         }
     }
@@ -138,6 +141,9 @@ pub struct Actor {
     // `None` disables retrying; `Some(d)` is the minimum delay between two
     // searches for the same episode.
     retry: Option<Duration>,
+    // `None` disables the off-season sweep; `Some(d)` is the minimum delay
+    // before sweeping the same season again.
+    sweep: Option<Duration>,
 }
 
 impl Actor {
@@ -165,7 +171,16 @@ impl Actor {
             pending_ttl,
             watching: HashMap::new(),
             retry,
+            sweep: None,
         }
+    }
+
+    /// Enable the off-season sweep. Separate from `new` so its already long
+    /// argument list does not grow another optional knob.
+    #[must_use]
+    pub fn with_sweep(mut self, sweep: Option<Duration>) -> Self {
+        self.sweep = sweep;
+        self
     }
 }
 
@@ -309,11 +324,23 @@ impl Actor {
                 self.upgrade_existing(&client, &series, np, rule, boost, &searched.searched_ids)
                     .await
             }
-            _ => Ok(()),
+            _ => Ok(HashSet::new()),
         };
+
+        // Seasons the targeted passes already cover. The sweep skips them so it
+        // does not fight a search for episodes about to be watched.
+        let mut covered = searched.window_seasons.clone();
+        covered.insert(np.season);
+        if let Ok(seasons) = &upgrade {
+            covered.extend(seasons);
+        }
+        let swept = self
+            .sweep_other_seasons(&client, &mut series, &covered)
+            .await;
 
         searched.result?;
         upgrade?;
+        swept?;
 
         Ok(Some(searched.missing))
     }
@@ -374,6 +401,10 @@ impl Actor {
                 return fetched;
             }
         };
+
+        fetched
+            .window_seasons
+            .extend(episodes.iter().map(|e| e.season_number));
 
         if episodes.len() < self.prefetch_num {
             info!("Not as many episodes announced, monitor new items instead");
@@ -459,11 +490,12 @@ impl Actor {
         rule: &boost::Rule,
         profile: &sonarr::QualityProfileResource,
         already_searched: &HashSet<i32>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<HashSet<i32>> {
         let episodes = client
             .episode_range(series, np.season, np.episode, rule.prefetch_num, true)
             .await
             .context("fetching episodes to upgrade")?;
+        let window_seasons: HashSet<i32> = episodes.iter().map(|e| e.season_number).collect();
 
         let queued = client
             .queued_episode_ids(series.id)
@@ -492,13 +524,13 @@ impl Actor {
 
         if to_search.is_empty() {
             info!("Nothing to upgrade");
-            return Ok(());
+            return Ok(window_seasons);
         }
 
         client.update_episode_monitoring(&to_search).await?;
         client.search_episodes(&to_search).await?;
 
-        Ok(())
+        Ok(window_seasons)
     }
 
     fn refresh_pending(&mut self, np: &NowPlaying) {
@@ -544,6 +576,77 @@ impl Actor {
                 warn!(err = ?e, session_id = sid, "queue append failed");
             }
         }
+    }
+
+    /// Search whole seasons other than the one being watched, to backfill the
+    /// rest of the series in fewer indexer queries than one search per episode.
+    ///
+    /// The season being streamed is never swept. Sonarr replaces files in place
+    /// on upgrade and a season pack covers the episode playing right now, so a
+    /// pack for the current season could swap the file out mid-playback. Other
+    /// seasons carry no such risk.
+    async fn sweep_other_seasons(
+        &mut self,
+        client: &sonarr::Client,
+        series: &mut sonarr::SeriesResource,
+        covered: &HashSet<i32>,
+    ) -> anyhow::Result<()> {
+        let Some(cooldown) = self.sweep else {
+            return Ok(());
+        };
+        let cooldown = i64::try_from(cooldown.as_secs()).unwrap_or(i64::MAX);
+        let now = time::now().and_then(|n| i64::try_from(n).ok()).unwrap_or(0);
+
+        let episodes = client
+            .episodes(series, false)
+            .await
+            .context("listing episodes to sweep")?;
+
+        let mut by_season: BTreeMap<i32, Vec<&sonarr::EpisodeResource>> = BTreeMap::new();
+        for e in &episodes {
+            by_season.entry(e.season_number).or_default().push(e);
+        }
+
+        let candidates: Vec<i32> = by_season
+            .into_iter()
+            .filter(|(num, _)| {
+                // Specials have no meaningful order, so they are never part of
+                // a prefetch and never worth a bulk search.
+                *num != 0
+            })
+            .filter(|(num, _)| !covered.contains(num))
+            .filter(|(num, _)| {
+                series
+                    .season(*num)
+                    .is_some_and(sonarr::SeasonResource::is_fully_aired)
+            })
+            .filter(|(_, eps)| eps.iter().any(|e| !e.has_file))
+            .filter(|(num, eps)| {
+                // Judged from the most recent search across the season: if any
+                // episode was searched lately the season as a whole was too.
+                let last = eps
+                    .iter()
+                    .filter_map(|e| e.last_search_time.as_deref())
+                    .filter_map(time::parse_utc_timestamp)
+                    .max();
+                let recent = last.is_some_and(|last| now.saturating_sub(last) < cooldown);
+                if recent {
+                    debug!(season = num, "swept recently, skipping");
+                }
+                !recent
+            })
+            .map(|(num, _)| num)
+            .collect();
+
+        for num in candidates {
+            info!(season = num, "sweeping season");
+            if let Err(err) = client.search_season(series, num).await {
+                // One unsweepable season must not abort the rest.
+                error!("skip sweeping season {num}: {err:#}");
+            }
+        }
+
+        Ok(())
     }
 
     fn touch_watch(&mut self, np: &NowPlaying) {
@@ -2335,6 +2438,190 @@ mod test {
         actor.prefetch(boosted_np()).await?;
 
         assert_eq!(fake.commands().len(), 1);
+        Ok(())
+    }
+
+    // ---- off-season sweep ----
+
+    /// Four seasons (0 specials + 1..3), all fully aired, nothing on disk.
+    fn swept_series() -> serde_json::Value {
+        make_series(
+            1234,
+            "TestShow",
+            5678,
+            &[
+                make_season(0, false, true),
+                make_season(1, false, true),
+                make_season(2, false, true),
+                make_season(3, false, true),
+            ],
+        )
+    }
+
+    fn swept_episodes() -> Vec<serde_json::Value> {
+        let mut eps = Vec::new();
+        for s in 1..=3 {
+            for e in 1..=8 {
+                eps.push(make_episode(s * 10 + e, 1234, s, e, false));
+            }
+        }
+        eps
+    }
+
+    fn actor_with_sweep(
+        fake: &FakeSonarr,
+        prefetch_num: usize,
+        cooldown: Duration,
+    ) -> super::Actor {
+        actor_with_instances(vec![instance(fake)], prefetch_num, false).with_sweep(Some(cooldown))
+    }
+
+    fn seasons_searched(fake: &FakeSonarr) -> Vec<i64> {
+        let mut v: Vec<i64> = fake
+            .commands()
+            .iter()
+            .filter(|c| c["name"].as_str() == Some("SeasonSearch"))
+            .filter_map(|c| c["seasonNumber"].as_i64())
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    // The season being streamed must never be season-searched: Sonarr replaces
+    // files in place, so a pack would swap out the episode playing right now.
+    #[tokio::test]
+    #[test_log::test]
+    async fn sweep_skips_streaming_season() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(swept_series());
+        fake.add_episodes(swept_episodes());
+
+        // The last episode of season 1, so the prefetch window falls entirely
+        // into season 2. Season 1 is then excluded *only* by the streaming-season
+        // rule — watching mid-season would mask it behind `window_seasons`.
+        actor_with_sweep(&fake, 1, Duration::from_secs(3600))
+            .prefetch(NowPlaying {
+                series: Series::Title("TestShow".to_string()),
+                episode: 8,
+                season: 1,
+                ..np_default()
+            })
+            .await?;
+
+        assert!(
+            !seasons_searched(&fake).contains(&1),
+            "season 1 is being watched and must not be swept, got {:?}",
+            seasons_searched(&fake)
+        );
+        Ok(())
+    }
+
+    // Fully aired seasons outside the prefetch window are backfilled in bulk.
+    #[tokio::test]
+    #[test_log::test]
+    async fn sweep_searches_other_seasons() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(swept_series());
+        fake.add_episodes(swept_episodes());
+
+        actor_with_sweep(&fake, 1, Duration::from_secs(3600))
+            .prefetch(NowPlaying {
+                series: Series::Title("TestShow".to_string()),
+                episode: 3,
+                season: 1,
+                ..np_default()
+            })
+            .await?;
+
+        assert_eq!(seasons_searched(&fake), vec![2, 3]);
+        Ok(())
+    }
+
+    // A season swept moments ago is left alone on the next episode.
+    #[tokio::test]
+    #[test_log::test]
+    async fn sweep_respects_cooldown() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(swept_series());
+        fake.add_episodes(swept_episodes());
+
+        let mut actor = actor_with_sweep(&fake, 1, Duration::from_secs(3600));
+        let np = NowPlaying {
+            series: Series::Title("TestShow".to_string()),
+            episode: 3,
+            season: 1,
+            ..np_default()
+        };
+        actor.prefetch(np.clone()).await?;
+        assert_eq!(seasons_searched(&fake), vec![2, 3]);
+        fake.clear_commands();
+
+        // A different episode, so `Seen` does not gate the whole prefetch —
+        // only the cooldown should hold the sweep back.
+        actor.prefetch(NowPlaying { episode: 4, ..np }).await?;
+
+        assert!(
+            seasons_searched(&fake).is_empty(),
+            "swept again within the cooldown: {:?}",
+            seasons_searched(&fake)
+        );
+        Ok(())
+    }
+
+    // Nothing to fetch, or not fully aired, means nothing to sweep.
+    #[tokio::test]
+    #[test_log::test]
+    async fn sweep_skips_complete_and_airing_seasons() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        let mut series = swept_series();
+        series["seasons"][2] = make_season(2, false, false); // still airing
+        fake.add_series(series);
+        let mut eps = swept_episodes();
+        for e in &mut eps {
+            if e["seasonNumber"].as_i64() == Some(3) {
+                e["hasFile"] = true.into(); // already complete
+            }
+        }
+        fake.add_episodes(eps);
+
+        actor_with_sweep(&fake, 1, Duration::from_secs(3600))
+            .prefetch(NowPlaying {
+                series: Series::Title("TestShow".to_string()),
+                episode: 3,
+                season: 1,
+                ..np_default()
+            })
+            .await?;
+
+        assert!(
+            seasons_searched(&fake).is_empty(),
+            "swept a season that was airing or already complete: {:?}",
+            seasons_searched(&fake)
+        );
+        Ok(())
+    }
+
+    // Without the option the command stream is exactly what it was before.
+    #[tokio::test]
+    #[test_log::test]
+    async fn sweep_disabled_by_default() -> Result<(), Box<dyn std::error::Error>> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(swept_series());
+        fake.add_episodes(swept_episodes());
+
+        actor(&fake, 1, false)
+            .prefetch(NowPlaying {
+                series: Series::Title("TestShow".to_string()),
+                episode: 3,
+                season: 1,
+                ..np_default()
+            })
+            .await?;
+
+        assert_eq!(
+            fake.commands(),
+            vec![json!({"name": "EpisodeSearch", "episodeIds": [14]})]
+        );
         Ok(())
     }
 }

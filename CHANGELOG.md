@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Sonarr's download queue. Controlled by `retry_unavailable` and
   `retry_interval`.
 
+- Optional `sweep_seasons`, which bulk-searches whole seasons other than the one
+  being watched to backfill a series in far fewer indexer requests than one
+  search per episode. The season being streamed is never swept, since a season
+  pack would replace the file currently playing. Off by default: it downloads
+  the whole series over time. Paced by `sweep_cooldown`.
+
 ### Changed
 
 - Series carrying a boost tag are always searched episode-wise, even with
