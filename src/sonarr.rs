@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, anyhow};
 use reqwest::{
     Url,
@@ -6,6 +8,8 @@ use reqwest::{
 use rustls_platform_verifier::ConfigVerifierExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+
+use crate::media_server::EpisodeRef;
 use tracing::{debug, error, info, instrument, warn};
 
 #[derive(Debug)]
@@ -224,6 +228,52 @@ impl Client {
         )
         .await
         .context("error fetching episodes")
+    }
+
+    // Fetch just the episodes matching the given (season, episode) refs. Used by
+    // the retry pass to re-read `has_file` for episodes it already searched.
+    pub async fn episodes_matching(
+        &self,
+        series: &SeriesResource,
+        refs: &HashSet<EpisodeRef>,
+    ) -> Result<Vec<EpisodeResource>> {
+        let episodes = self.episodes(series).await?;
+        Ok(episodes
+            .into_iter()
+            .filter(|e| refs.contains(&EpisodeRef::new(e.season_number, e.episode_number)))
+            .collect())
+    }
+
+    // Episode IDs with an active entry in Sonarr's download queue. An episode in
+    // here is still on its way, so re-searching it would fight the download in
+    // progress.
+    pub async fn queued_episode_ids(&self) -> Result<HashSet<i32>> {
+        let queue: Value = self
+            .get("queue", Some(&[("pageSize", "1000")]))
+            .await
+            .context("error fetching queue")?;
+
+        // Sonarr reports `episodeId` on episode-level records; newer versions may
+        // instead carry an `episodeIds` array. Accept either and ignore records
+        // with neither rather than failing the whole call.
+        let ids = queue["records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|record| {
+                let single = record["episodeId"].as_i64().into_iter();
+                let many = record["episodeIds"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_i64)
+                    .collect::<Vec<_>>();
+                single.chain(many)
+            })
+            .filter_map(|id| i32::try_from(id).ok())
+            .collect();
+
+        Ok(ids)
     }
 
     pub async fn episode_range(

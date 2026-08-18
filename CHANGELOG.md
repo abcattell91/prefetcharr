@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Retry searches for prefetched episodes that never turned up. While a series is
+  being watched, prefetcharr re-checks whether the episodes it searched for have
+  a file yet and searches again if they do not, skipping anything currently in
+  Sonarr's download queue. Controlled by `retry_unavailable` and
+  `retry_interval`.
+
+### Fixed
+
+- A prefetch abandoned with episodes still missing is no longer remembered as
+  handled, so playing that episode again later searches for them once more.
+- The polling interval is no longer shortened to 60s indefinitely when
+  `append_to_queue` is disabled.
+
 
 ## [1.6.2] - 2026-07-19
 
