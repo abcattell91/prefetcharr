@@ -19,6 +19,7 @@ struct SonarrState {
     episodes: Vec<Value>,
     tags: Vec<Value>,
     commands: Vec<Value>,
+    queued: Vec<i32>,
 }
 
 impl FakeSonarr {
@@ -28,6 +29,7 @@ impl FakeSonarr {
             episodes: Vec::new(),
             tags: Vec::new(),
             commands: Vec::new(),
+            queued: Vec::new(),
         }));
 
         let router = Router::new()
@@ -38,6 +40,7 @@ impl FakeSonarr {
             .route("/api/v3/episode", get(get_episodes))
             .route("/api/v3/episode/monitor", put(put_episode_monitor))
             .route("/api/v3/command", post(post_command))
+            .route("/api/v3/queue", get(get_queue))
             .with_state(state.clone());
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -68,6 +71,25 @@ impl FakeSonarr {
             .unwrap()
             .tags
             .push(json!({"id": id, "label": label}));
+    }
+
+    // Episode IDs Sonarr should report as actively downloading.
+    pub fn set_queued(&self, ids: &[i32]) {
+        self.state.lock().unwrap().queued = ids.to_vec();
+    }
+
+    // Simulate Sonarr importing (or losing) a file for an episode.
+    pub fn set_has_file(&self, id: i32, has_file: bool) {
+        let mut state = self.state.lock().unwrap();
+        for ep in &mut state.episodes {
+            if ep["id"].as_i64() == Some(i64::from(id)) {
+                ep["hasFile"] = Value::Bool(has_file);
+            }
+        }
+    }
+
+    pub fn clear_commands(&self) {
+        self.state.lock().unwrap().commands.clear();
     }
 
     pub fn commands(&self) -> Vec<Value> {
@@ -189,6 +211,22 @@ async fn put_series(
     }
 
     Json(json!({}))
+}
+
+async fn get_queue(State(state): State<Arc<Mutex<SonarrState>>>) -> Json<Value> {
+    let records: Vec<Value> = state
+        .lock()
+        .unwrap()
+        .queued
+        .iter()
+        .map(|id| json!({"id": id, "episodeId": id}))
+        .collect();
+    Json(json!({
+        "page": 1,
+        "pageSize": 1000,
+        "totalRecords": records.len(),
+        "records": records,
+    }))
 }
 
 async fn get_tags(State(state): State<Arc<Mutex<SonarrState>>>) -> Json<Value> {

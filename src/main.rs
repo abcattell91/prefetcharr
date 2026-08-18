@@ -217,6 +217,16 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .map(Ok) // align with the error type of `PollSender`
         .forward(sink);
 
+    let retry = config
+        .retry_unavailable
+        .then(|| Duration::from_secs(config.retry_interval));
+    if let Some(retry) = retry {
+        info!(
+            "Re-searching unavailable episodes every {}s",
+            retry.as_secs()
+        );
+    }
+
     let seen = Seen::default();
     let mut actor = process::Actor::new(
         rx,
@@ -228,6 +238,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         queue,
         has_pending,
         pending_ttl,
+        retry,
     );
 
     let _ = tokio::join!(np_updates, actor.process(), client.run());

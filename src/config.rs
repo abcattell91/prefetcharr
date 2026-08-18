@@ -51,6 +51,9 @@ impl From<LogLevel> for tracing::Level {
     }
 }
 
+// Independent user-facing switches, not a state machine — the lint's suggested
+// refactor does not apply to a flat config file.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Deserialize)]
 pub struct Config {
     pub media_server: MediaServer,
@@ -70,8 +73,22 @@ pub struct Config {
     /// Append upcoming episodes to the active player queue
     #[serde(default)]
     pub append_to_queue: bool,
+    /// Re-search prefetched episodes that never turned up, while still watching
+    #[serde(default = "default_retry_unavailable")]
+    pub retry_unavailable: bool,
+    /// Minimum seconds between two searches for the same episode
+    #[serde(default = "default_retry_interval")]
+    pub retry_interval: u64,
     #[serde(default)]
     pub legacy: bool,
+}
+
+fn default_retry_unavailable() -> bool {
+    true
+}
+
+fn default_retry_interval() -> u64 {
+    1800
 }
 
 impl From<LegacyArgs> for Config {
@@ -112,6 +129,8 @@ impl From<LegacyArgs> for Config {
             request_seasons: true,
             connection_retries,
             append_to_queue: false,
+            retry_unavailable: default_retry_unavailable(),
+            retry_interval: default_retry_interval(),
             legacy: true,
         }
     }
