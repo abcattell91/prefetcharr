@@ -8,6 +8,8 @@ use reqwest::{
 use rustls_platform_verifier::ConfigVerifierExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+
+use crate::media_server::EpisodeRef;
 use tracing::{debug, error, info, instrument, warn};
 
 #[derive(Debug)]
@@ -319,7 +321,7 @@ impl Client {
         Ok(())
     }
 
-    async fn episodes(
+    pub async fn episodes(
         &self,
         series: &SeriesResource,
         include_episode_file: bool,
@@ -349,6 +351,20 @@ impl Client {
         )
         .await
         .context("error fetching episodes")
+    }
+
+    // Fetch just the episodes matching the given (season, episode) refs. Used by
+    // the retry pass to re-read `has_file` for episodes it already searched.
+    pub async fn episodes_matching(
+        &self,
+        series: &SeriesResource,
+        refs: &HashSet<EpisodeRef>,
+    ) -> Result<Vec<EpisodeResource>> {
+        let episodes = self.episodes(series, false).await?;
+        Ok(episodes
+            .into_iter()
+            .filter(|e| refs.contains(&EpisodeRef::new(e.season_number, e.episode_number)))
+            .collect())
     }
 
     pub async fn episode_range(

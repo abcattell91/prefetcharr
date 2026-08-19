@@ -79,6 +79,26 @@ impl From<&NowPlaying> for PrefetchKey {
     }
 }
 
+// Identity of "who is watching what". Excludes season/episode so one entry
+// covers the whole viewing of a series, and excludes `session_id` so backends
+// that do not report one (Tautulli) are covered too.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct WatchKey {
+    pub series: Series,
+    pub user: User,
+    pub library: Option<String>,
+}
+
+impl From<&NowPlaying> for WatchKey {
+    fn from(np: &NowPlaying) -> Self {
+        Self {
+            series: np.series.clone(),
+            user: np.user.clone(),
+            library: np.library.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct User {
     pub name: String,
